@@ -75,6 +75,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "version", "renderdoc\render
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "renderdocui_stub", "qrenderdoc\renderdocui_stub.vcxproj", "{37955C79-D91D-423F-8C6C-8F5BCF4F28D4}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "version_proxy", "version_proxy\version_proxy.vcxproj", "{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NV", "renderdoc\driver\ihv\nv\NV.vcxproj", "{40349AD9-5558-4DF4-84E2-11934DE90A11}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Intel", "renderdoc\driver\ihv\intel\Intel.vcxproj", "{7FCB5FC5-1DBD-4DA6-83A0-6BA4E945BDA5}"
@@ -273,6 +275,14 @@ Global
 		{F9CCE6CA-0CA3-4A22-9C7B-881369955E62}.Release|x64.Build.0 = Release|x64
 		{F9CCE6CA-0CA3-4A22-9C7B-881369955E62}.Release|x86.ActiveCfg = Release|Win32
 		{F9CCE6CA-0CA3-4A22-9C7B-881369955E62}.Release|x86.Build.0 = Release|Win32
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}.Development|x64.ActiveCfg = Development|x64
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}.Development|x64.Build.0 = Development|x64
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}.Development|x86.ActiveCfg = Development|Win32
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}.Development|x86.Build.0 = Development|Win32
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}.Release|x64.ActiveCfg = Release|x64
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}.Release|x64.Build.0 = Release|x64
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}.Release|x86.ActiveCfg = Release|Win32
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -307,5 +317,6 @@ Global
 		{40349AD9-5558-4DF4-84E2-11934DE90A11} = {4DA2F3E3-9A65-45DD-A69B-82C7757D4904}
 		{7FCB5FC5-1DBD-4DA6-83A0-6BA4E945BDA5} = {4DA2F3E3-9A65-45DD-A69B-82C7757D4904}
 		{F9CCE6CA-0CA3-4A22-9C7B-881369955E62} = {4DA2F3E3-9A65-45DD-A69B-82C7757D4904}
+		{B3A2C5D1-7E4F-4A8B-9C6D-1F2E3A4B5C6D} = {B5A783D9-AEB9-420D-8E77-D4D930F8D88C}
 	EndGlobalSection
 EndGlobal

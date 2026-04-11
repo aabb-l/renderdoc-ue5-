@@ -1,0 +1,353 @@
+前言
+之前写过一些截帧的文章，主要是通过模拟器来绕过加密系统，但是现在想想有可能两个游戏在移动端和PC端上用的Shader不一样，现在想用RenderDoc来截取PC环境下两个游戏的Shader。
+
+目标游戏：《洛克王国：世界》（腾讯，UE5，DX11，64位）
+源码：https://github.com/Go1c/renderdoc（v1.x fork）
+编译环境：VS2022，工具集 v143，Release x64 + Win32
+
+
+《鸣潮》是如何检测到RenderDoc的？
+如果你是直接下载的打包好的RenderDoc，那么无论你是否从RenderDoc启动游戏还是是否有任何注入，都会显示启用了黑客工具
+
+此外，《鸣潮》采用了CrashSight 检测，所以在做的时候不但要修改RenderDoc的特征码，还需要修改注入方式
+
+前期准备
+源码在 F:\renderdoc\src\，编译输出在 F:\renderdoc\src\x64\Release\ 和 F:\renderdoc\src\Win32\Release\
+运行目录：F:\rdtest\（x64文件） 和 F:\rdtest\x86\（Win32文件）
+
+编译注意事项：
+- 工具集改为 v143（VS2022原生）
+- renderdoc.vcxproj 需加 /utf-8 编译选项（否则C4819报错）
+- renderdoc.vcxproj 需关闭 WholeProgramOptimization（否则vk_wsi_funcs.cpp ICE崩溃）
+- 需同时编译 x64 和 Win32，否则注入32位进程会报错
+
+
+一、修改RenderDoc的特征来绕过检测（已完成）
+
+核心 DLL — Replay Marker 符号
+文件路径                                    修改前                          修改后
+renderdoc/api/replay/renderdoc_replay.h     renderdoc__replay__marker()     rendertest__replay__marker()
+
+可执行文件路径（全局替换）
+文件路径                                    修改前                          修改后
+renderdoc/os/win32/win32_process.cpp        renderdoccmd.exe（所有处）       rendertestcmd.exe
+renderdoc/os/win32/win32_process.cpp        renderdocshim64.dll             rendertestshim64.dll
+renderdoc/os/win32/win32_process.cpp        renderdocshim32.dll             rendertestshim32.dll
+renderdoccmd/renderdoccmd_win32.cpp         qrenderdoc.exe（所有处）         qrendertest.exe
+
+进程白名单
+文件路径                                    修改前                          修改后
+renderdoc/os/win32/sys_win32_hooks.cpp      renderdoccmd.exe                rendertestcmd.exe
+renderdoc/os/win32/sys_win32_hooks.cpp      qrenderdoc.exe                  qrendertest.exe
+
+崩溃处理
+文件路径                                    修改前                          修改后
+renderdoccmd/renderdoccmd_win32.cpp         RENDERDOC_CRASHHANDLE            RENDERTEST_CRASHHANDLE
+renderdoccmd/renderdoccmd_win32.cpp         renderdoc.dll                   rendertest.dll
+renderdoc/core/crash_handler.h              RenderDoc\dumps\a               RenderTest\dumps\a
+renderdoc/core/crash_handler.h              RenderDocBreakpadServer%llu     RenderTestBreakpadServer%llu
+renderdoc/core/crash_handler.h              RENDERDOC_CRASHHANDLE（等待句柄）RENDERTEST_CRASHHANDLE
+renderdoc/core/crash_handler.h              renderdoccmd.exe crashhandle     rendertestcmd.exe crashhandle
+
+文件路径与注册表
+文件路径                                    修改前                          修改后
+renderdoc/os/win32/win32_stringio.cpp       qrenderdoc.exe（所有处）         qrendertest.exe
+renderdoc/os/win32/win32_stringio.cpp       RenderDoc.RDCCapture.1          RenderTest.RDCCapture.1
+renderdoc/os/win32/win32_stringio.cpp       RenderDoc\%ls_...（日志路径）    RenderTest\%ls_...
+
+OpenGL 窗口类名
+文件路径                                    修改前                          修改后
+renderdoc/driver/gl/wgl_platform.cpp        renderdocGLclass                rendertestGLclass
+
+全局 Hook 共享内存
+文件路径                                    修改前                          修改后
+renderdocshim/renderdocshim.h               RenderDocGlobalHookData64       RenderTestGlobalHookData64
+renderdocshim/renderdocshim.h               RenderDocGlobalHookData32       RenderTestGlobalHookData32
+renderdocshim/renderdocshim.h               renderdocshim64.dll             rendertestshim64.dll
+renderdocshim/renderdocshim.h               renderdocshim32.dll             rendertestshim32.dll
+
+资源文件（PE版本信息）
+文件路径                                    修改前                          修改后
+renderdoc/data/renderdoc.rc                 Core DLL for RenderDoc          Core DLL for RenderTest
+renderdoc/data/renderdoc.rc                 ProductName: RenderDoc          ProductName: RenderTest
+
+Qt UI层
+文件路径                                    修改前                          修改后
+qrenderdoc/renderdocui_stub.cpp             qrenderdoc.exe                  qrendertest.exe
+qrenderdoc/Code/qrenderdoc.cpp              qrenderdoc（翻译上下文）          qrendertest
+qrenderdoc/Code/qrenderdoc.cpp              QRenderDoc initialising.        QRenderTest initialising.
+qrenderdoc/Code/qrenderdoc.cpp              QRenderDoc（会话名/版本输出）     QRenderTest
+qrenderdoc/Windows/MainWindow.cpp           RenderDoc（窗口标题）            RenderTest
+qrenderdoc/Windows/Dialogs/UpdateDialog.cpp renderdoc.dll / renderdoccmd.exe rendertest.dll / rendertestcmd.exe
+
+VS项目文件（输出文件名）
+文件路径                                    修改前                          修改后
+renderdoc/renderdoc.vcxproj                 ProjectName: renderdoc           rendertest（输出rendertest.dll）
+renderdoccmd/renderdoccmd.vcxproj           ProjectName: renderdoccmd        rendertestcmd
+renderdocshim/renderdocshim.vcxproj         ProjectName: renderdocshim       rendertestshim（输出rendertestshim32/64.dll）
+qrenderdoc/qrenderdoc_local.vcxproj         qrenderdoc                       qrendertest（输出qrendertest.exe）
+qrenderdoc/renderdocui_stub.vcxproj         renderdocui_stub                 rendertestui_stub + UAC RequireAdministrator
+
+
+二、注入方式修改（已完成，效果待验证）
+
+修改文件：renderdoc/os/win32/win32_process.cpp
+函数：InjectDLL()
+
+原始方式：CreateRemoteThread + LoadLibraryW（被ACE直接拦截）
+
+新方式：SetThreadContext 劫持主线程
+1. 用 CreateToolhelp32Snapshot 枚举目标进程所有线程，找创建时间最早的（主线程）
+2. SuspendThread 挂起主线程
+3. GetThreadContext 保存原始 RIP
+4. 在远程内存写入 shellcode（sub rsp/mov rcx dllPath/mov rax LoadLibraryW/call rax/add rsp/jmp origRip）
+5. SetThreadContext 把 RIP 指向 shellcode
+6. ResumeThread，等待 shellcode 执行完（轮询 RIP 是否已返回原始位置）
+7. 失败时 fallback 到 CreateRemoteThread
+
+调用点：InjectDLL(hProcess, renderdocPath, pid) — 传入 pid 用于枚举线程
+
+
+三、测试结果
+
+方法                    结果
+Launch（主exe直接启动） 游戏报"缺失游戏文件"，必须走启动器
+Launch（启动器）        游戏启动但注入无效，Attach列表空
+Global Process Hook     报错"Couldn't start global hook / renderdoccmd not found"（short path问题）
+Global Hook（修复后）   F盘short path已启用，但hook仍然无法注入，ACE拦截
+rendertestcmd inject    报 "Failed to inject rendertest.dll into process"，注入失败
+
+结论：特征码改名绕过成功（游戏无检测弹窗），但 ACE（tpstackflt.sys）在内核层拦截了所有注入方式
+
+
+四、DLL劫持方案（version.dll proxy）
+
+原理：游戏启动时 Windows 按搜索顺序加载 DLL，exe 目录优先于 System32。
+游戏目录里没有 version.dll，所以放一个 proxy version.dll 进去，游戏就会自动加载。
+proxy DLL 在 DllMain 中：
+1. 从 System32 加载真正的 version.dll，转发全部 17 个导出函数
+2. LoadLibrary 加载同目录下的 rendertest.dll，完成截帧 DLL 注入
+
+源码位置：F:\renderdoc\src\version_proxy\
+项目文件：version_proxy.vcxproj（已加入 renderdoc.sln，Utility 文件夹下）
+输出文件：version.dll（Release x64）
+编译配置：Release x64，工具集 v143，静态链接 CRT（/MT）
+
+部署步骤：
+1. VS2022 打开 renderdoc.sln，选 Release x64
+2. 右键 version_proxy 项目 → 生成
+3. 从 F:\renderdoc\src\x64\Release\ 拷贝 version.dll 到游戏目录
+4. 从 F:\rdtest\ 拷贝 rendertest.dll 到游戏目录
+5. 通过启动器正常启动游戏
+6. 检查游戏目录下 version_proxy.log 确认加载情况
+
+游戏目录：F:\洛克王国：世界(2002304)\Win64\NRC\Binaries\Win64\
+
+测试结果：
+- rendertest.dll 加载成功（version_proxy.log 显示 3 次加载，启动器+游戏进程+子进程）
+- qrendertest.exe Attach 列表中可以看到 NRC-Win64-Shipping.exe
+- 但 ACE 检测到 version.dll 劫持，弹窗"安全系统检测到非法劫持模块，请删除 version.dll"
+
+结论：version.dll 是 ACE 的已知劫持检测目标。
+ACE 会扫描游戏目录下是否存在常见的系统 DLL proxy（version.dll 等），发现即标记为劫持。
+注入本身是成功的，问题出在 ACE 对 version.dll 这个文件名的针对性检测。
+
+
+五、替换游戏自带 DLL 方案（PluginCrosCurl.dll proxy）— 失败
+
+思路：把游戏自带的 PluginCrosCurl.dll（只有1个导出函数）替换为 proxy，
+原始 DLL 改名为 PluginCrosCurl_orig.dll，proxy 转发并加载 rendertest.dll。
+
+测试结果：
+- 启动器检测到 PluginCrosCurl.dll 被修改，弹出"修复"按钮，游戏无法启动
+- 说明启动器/ACE 对游戏自带 DLL 有文件完整性校验（哈希校验）
+
+结论：不能替换游戏已有的任何 DLL。
+
+
+ACE 检测机制总结（目前已知）：
+
+| 检测层 | 触发条件 | 结果 |
+|--------|----------|------|
+| 文件名黑名单 | 游戏目录新增 version.dll 等已知劫持系统DLL | 进入游戏后弹窗"检测到非法劫持模块" |
+| 文件完整性校验 | 游戏自带的 DLL 被替换/修改 | 启动器弹"修复"按钮，无法启动 |
+| 新增未知DLL | 新增 rendertest.dll 等自定义名字 | 未检测（version.dll方案时未拦截） |
+
+关键发现：
+- version.dll 方案时游戏成功启动并进入主界面，rendertest.dll 也成功加载
+- ACE 是在游戏运行时才扫描到 version.dll 这个文件名
+- 新增 rendertest.dll（自定义名字）未被 ACE 拦截
+- 因此只要 proxy DLL 的文件名不在 ACE 的黑名单里，就能成功
+
+
+九、dxgi.dll 完整 Proxy 方案（成功！API=D3D12，截帧生效）
+
+原理：
+游戏 exe 不隐式导入 dxgi.dll，而是 UE5 在 D3D12Adapter.cpp 中通过
+FPlatformProcess::GetDllHandle("dxgi.dll") 即 LoadLibrary("dxgi.dll") 动态加载。
+dxgi.dll 不在 Windows KnownDLLs 列表中，所以 LoadLibrary 按标准搜索顺序，
+游戏目录（exe目录）优先于 System32。
+
+放一个 proxy dxgi.dll 到游戏目录，游戏就会加载它而不是 System32 的。
+proxy 在 DllMain 中提前加载真正的 System32 DLL 和 rendertest.dll，
+确保 RenderDoc 的 inline hook 在游戏调用任何 D3D 函数之前就已安装。
+
+源码位置：F:\renderdoc\src\version_proxy\（复用原 version_proxy 项目）
+输出文件：dxgi.dll（Release x64）
+编译配置：Release x64，工具集 v143，静态链接 CRT（/MT）
+
+完整调用链：
+1. UE5 调用 LoadLibrary("dxgi.dll")
+   → Windows 从游戏目录加载 proxy dxgi.dll
+2. proxy DllMain(DLL_PROCESS_ATTACH):
+   a. LoadLibrary("C:\Windows\System32\dxgi.dll") — 加载真正 dxgi
+   b. LoadLibrary("C:\Windows\System32\d3d12.dll") — 加载真正 d3d12（关键！）
+   c. GetProcAddress 缓存所有 20 个真正 dxgi 函数指针（在 IAT hook 之前！）
+   d. LoadLibrary(rendertest.dll) — RenderDoc 初始化:
+      - RegisterHooks → EndHookRegistration
+      - HookAllModules() — IAT hook 所有模块
+      - MinHook inline hook:
+        * dxgi.dll: 选择 System32 模块（altmodules 机制）
+        * 直接从 System32 模块 GetProcAddress 获取函数地址
+        * MH_CreateHook patch System32 dxgi.dll 的 CreateDXGIFactory/1/2 入口
+        * 同理 patch d3d12.dll 的 D3D12CreateDevice 等
+3. proxy DllMain 返回
+4. UE5 调用 GetProcAddress(proxy, "CreateDXGIFactory2")
+5. proxy 的 CreateDXGIFactory2 被调用
+   → 通过缓存指针调用 System32 dxgi.dll 的 CreateDXGIFactory2
+   → 但该入口已被 MinHook patch 为 jmp（E9 xx xx xx xx）
+   → 跳转到 RenderDoc 的 CreateDXGIFactory2_hook
+   → hook 调用 trampoline（System32 原始代码）获得真正 factory
+   → HandleWrap 包装为 WrappedIDXGIFactory
+   → 返回包装后的 factory 给游戏
+6. UE5 通过包装的 factory 枚举 adapter，调用 D3D12CreateDevice
+   → inline hook 拦截 → RenderDoc 包装设备
+7. RenderDoc 截帧生效，API 显示 D3D12
+
+踩过的坑（按解决顺序）：
+
+1. 递归调用（9万次 CreateDXGIFactory）
+   原因：proxy 导出函数中通过 GetProcAddress 获取真正函数指针，但 rendertest.dll
+   加载后 IAT hook 了 proxy 的 GetProcAddress 为 Hooked_GetProcAddress，
+   它对已注册 hook 的 DLL 函数返回 hook 后的地址，导致 proxy 调回 RenderDoc hook。
+   修复：在 rendertest.dll 加载之前就缓存所有真正函数指针（CacheAllRealProcs）。
+
+2. Inline hook 装在 proxy 上而不是 System32 上
+   原因：ForAllModules 枚举模块时 proxy 先被匹配（同名 "dxgi.dll"），
+   成为 DllHooks["dxgi.dll"].module。后来 System32 的进入 altmodules。
+   MinHook 从 module（proxy）GetProcAddress 获取的是 proxy 的函数地址。
+   修复：inline hook 代码中遍历 altmodules，优先选择来自 System32 的模块。
+
+3. Inline hook 用了旧的 *hook.orig 地址（来自 proxy）
+   原因：ApplyHooks 阶段 *hook.orig 被设为 GetProcAddress(proxy, func)，
+   inline hook 代码中 if(*hook.orig == NULL) 条件为 false 跳过了重新获取。
+   修复：inline hook 代码中不使用 *hook.orig，直接从 hookModule GetProcAddress。
+
+4. D3D12CreateDevice 没有被 inline hook
+   原因：d3d12.dll 是 delay-load，在 rendertest.dll 初始化时尚未加载，
+   DllHooks["d3d12.dll"].module == NULL，inline hook 跳过。
+   修复：proxy DllMain 中提前 LoadLibrary("C:\Windows\System32\d3d12.dll")。
+
+修改的文件清单：
+- version_proxy/version_proxy.cpp — 完全重写为 dxgi proxy
+- version_proxy/version_proxy.def — 改为 LIBRARY "dxgi"，20 个导出函数
+- version_proxy/version_proxy.vcxproj — TargetName 改为 dxgi
+- renderdoc/os/win32/win32_hook.cpp — inline hook 优先选 System32 模块 + 重新获取地址
+- renderdoc/driver/dxgi/dxgi_hooks.cpp — 添加调试日志（可选保留）
+
+部署步骤：
+1. VS2022 编译 version_proxy 项目（Release x64）→ 输出 dxgi.dll
+2. VS2022 编译 renderdoc 项目（Release x64）→ 输出 rendertest.dll
+3. 拷贝 dxgi.dll + rendertest.dll 到游戏目录
+4. 通过启动器启动游戏
+5. qrendertest.exe Attach → API 显示 D3D12 → F12 截帧
+
+测试结果：
+- RenderDoc 成功拦截所有 DXGI Factory 创建和 D3D12 设备创建
+- API 显示 D3D12 (Presenting & supported)
+- 截帧成功
+- 但 ACE 在约 10 秒后检测到 dxgi.dll 并杀掉进程
+
+当前问题：（已解决）
+- ACE 黑名单包含 dxgi.dll（和之前的 version.dll 一样）
+- 需要换一个不在黑名单中的文件名/加载方式
+- 已知不被检测的文件名：XAudio2_9Redist.dll、rendertest.dll（自定义名字）
+- 技术方案本身完全可行，只差绕过 ACE 的 DLL 文件名检测
+
+
+十、绕过 ACE DLL 文件名检测（最终方案，完全成功）
+
+问题：
+dxgi.dll proxy 技术上完全可行（API=D3D12，截帧生效），但 ACE 在游戏启动约 10 秒后
+扫描到进程中有名为 "dxgi.dll" 的非系统模块，弹窗"检测到非法劫持模块"并杀掉进程。
+
+尝试过的绕过方式：
+
+1. XAudio2_9Redist.dll proxy（不被 ACE 检测）
+   失败原因：XAudio2 的 delay-load 触发时间晚于 dxgi LoadLibrary。
+   而且 XAudio2Create 返回失败后 delay-load helper 会 FreeLibrary 卸载 proxy。
+   即使用 GET_MODULE_HANDLE_EX_FLAG_PIN 阻止卸载，真正的游戏进程（不是启动器）
+   可能根本不触发 XAudio2 的 delay-load。
+
+2. PEB 模块名伪装（改 BaseDllName/FullDllName 为 "mfplat.dll"）
+   失败原因：ACE 不只是通过 PEB 枚举模块，还可能用 NtQueryVirtualMemory
+   (MemoryMappedFilenameInformation) 直接读取内核中 section object 的文件名，
+   PEB 改名无法影响内核层面的信息。
+
+3. 磁盘文件重命名 + PEB 伪装（最终成功方案）
+   在 DllMain 中加载完所有 DLL 后，立即做两件事：
+   a. MoveFileW 把磁盘上的 dxgi.dll 重命名为 dxgi.dll.tmp
+   b. 修改 PEB 中的 BaseDllName/FullDllName 为 "mfplat.dll"
+
+   成功原理：
+   - 文件重命名后，内核的 section object 引用的文件对象名也随之更新
+   - NtQueryVirtualMemory 返回的映射文件名变成 dxgi.dll.tmp（不再是 dxgi.dll）
+   - PEB 中显示的是 mfplat.dll
+   - 磁盘上文件名也不再是 dxgi.dll
+   - ACE 无论用哪种方式查询（PEB 枚举 / NtQueryVirtualMemory / 磁盘文件扫描）
+     都看不到 "dxgi.dll" 这个名字
+
+   注意：每次测试后需要把 dxgi.dll.tmp 改回 dxgi.dll，或重新拷贝。
+
+ACE 检测机制总结（最终版）：
+
+| 检测方式 | 检测内容 | 绕过方法 |
+|---------|---------|---------|
+| PEB 模块枚举 | BaseDllName / FullDllName | PEB masquerade（改名） |
+| NtQueryVirtualMemory | 内核 section object 文件名 | 磁盘文件重命名（MoveFile） |
+| 磁盘文件扫描 | 游戏目录下的文件名 | 磁盘文件重命名 |
+| 文件完整性校验 | 游戏自带 DLL 的哈希 | 不替换原有 DLL，只新增 |
+| 文件名黑名单 | version.dll, dxgi.dll 等 | 加载后立即重命名+PEB伪装 |
+
+实现细节（version_proxy.cpp 中的关键代码）：
+
+DllMain 执行顺序：
+1. LoadLibrary System32\dxgi.dll — 加载真正 dxgi
+2. LoadLibrary System32\d3d12.dll — 加载真正 d3d12
+3. GetProcAddress 缓存所有 20 个 dxgi 函数指针（在 IAT hook 之前）
+4. MoveFileW 重命名 dxgi.dll → dxgi.dll.tmp
+5. PEB MasqueradeModuleName → "mfplat.dll"
+6. LoadLibrary rendertest.dll — RenderDoc 初始化 + inline hook 安装
+7. DllMain 返回
+
+修改的文件（在第九章基础上新增）：
+- version_proxy/version_proxy.cpp — 新增 MasqueradeModuleName 函数 + MoveFileW 重命名
+
+最终测试结果：
+- ACE 未检测到任何异常，无弹窗
+- API 显示 D3D12 (Presenting & supported)
+- F12 截帧成功
+- 游戏正常运行
+
+
+十一、环境记录
+
+qrendertest.exe 运行路径：F:\rdtest\
+x86支持路径：F:\rdtest\x86\
+日志路径：C:\Users\win11\AppData\Local\Temp\RenderTest\
+游戏进程名：NRC-Win64-Shipping.exe
+游戏主exe路径：F:\洛克王国：世界(2002304)\Win64\NRC\Binaries\Win64\NRC-Win64-Shipping.exe
+游戏目录：F:\洛克王国：世界(2002304)\Win64\NRC\Binaries\Win64\
+proxy 日志：游戏目录\proxy.log
+RenderDoc 源码：F:\renderdoc\src\
+编译输出（x64 Release）：F:\renderdoc\src\x64\Release\
