@@ -27,7 +27,10 @@
 #include <windows.h>
 
 #include <tlhelp32.h>
+#include <delayimp.h>
 #include <algorithm>
+
+#include "minhook/include/MinHook.h"
 #include <functional>
 #include <map>
 #include <set>
@@ -66,7 +69,7 @@ bool ApplyHook(FunctionHook &hook, void **IATentry, bool &already)
   BOOL success = VirtualProtect(IATentry, sizeof(void *), PAGE_READWRITE, &oldProtection);
   if(!success)
   {
-    RDCERR("Failed to make IAT entry writeable 0x%p", IATentry);
+    RDCERR("Failed to make IAT entry writeable 0x%p for %s, error=%lu", IATentry, hook.function.c_str(), GetLastError());
     return false;
   }
 
@@ -357,6 +360,7 @@ struct CachedHookData
 
       if(hookset && importDesc->OriginalFirstThunk > 0)
       {
+        RDCLOG("ApplyHooks(%s): found hookable IAT for %s", lowername, dllName);
         IMAGE_THUNK_DATA *origFirst =
             (IMAGE_THUNK_DATA *)(baseAddress + importDesc->OriginalFirstThunk);
         IMAGE_THUNK_DATA *first = (IMAGE_THUNK_DATA *)(baseAddress + importDesc->FirstThunk);
@@ -516,6 +520,127 @@ struct CachedHookData
       importDesc++;
     }
 
+    // ======================================================================
+    // Also process delay import table (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT)
+    // UE5 games use delay-load for d3d11/dxgi/d3d12, which standard IAT
+    // hooking misses entirely.
+    // ======================================================================
+    DWORD delayImportOffset =
+        optHeader->DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
+
+    if(delayImportOffset)
+    {
+      ImgDelayDescr *delayDesc = (ImgDelayDescr *)(baseAddress + delayImportOffset);
+
+      while(delayDesc->rvaDLLName)
+      {
+        const char *dllName = (const char *)(baseAddress + delayDesc->rvaDLLName);
+
+        DllHookset *hookset = NULL;
+
+        for(auto it = DllHooks.begin(); it != DllHooks.end(); ++it)
+          if(!_stricmp(it->first.c_str(), dllName))
+            hookset = &it->second;
+
+        if(hookset && delayDesc->rvaINT && delayDesc->rvaIAT)
+        {
+          RDCLOG("ApplyHooks(%s): found hookable DELAY IAT for %s", lowername, dllName);
+
+          IMAGE_THUNK_DATA *origFirst =
+              (IMAGE_THUNK_DATA *)(baseAddress + delayDesc->rvaINT);
+          IMAGE_THUNK_DATA *first =
+              (IMAGE_THUNK_DATA *)(baseAddress + delayDesc->rvaIAT);
+
+          while(origFirst->u1.AddressOfData)
+          {
+            void **IATentry = (void **)&first->u1.AddressOfData;
+
+            struct hook_find
+            {
+              bool operator()(const FunctionHook &a, const char *b)
+              {
+                return strcmp(a.function.c_str(), b) < 0;
+              }
+            };
+
+#if ENABLED(RDOC_X64)
+            if(IMAGE_SNAP_BY_ORDINAL64(origFirst->u1.AddressOfData))
+#else
+            if(IMAGE_SNAP_BY_ORDINAL32(origFirst->u1.AddressOfData))
+#endif
+            {
+              WORD ordinal = IMAGE_ORDINAL64(origFirst->u1.AddressOfData);
+
+              if(!hookset->OrdinalNames.empty())
+              {
+                if(ordinal >= hookset->OrdinalBase)
+                {
+                  DWORD nameIndex = ordinal - hookset->OrdinalBase;
+
+                  if(nameIndex < hookset->OrdinalNames.size())
+                  {
+                    const char *importName = (const char *)hookset->OrdinalNames[nameIndex].c_str();
+
+                    auto found =
+                        std::lower_bound(hookset->FunctionHooks.begin(),
+                                         hookset->FunctionHooks.end(), importName, hook_find());
+
+                    if(found != hookset->FunctionHooks.end() &&
+                       !strcmp(found->function.c_str(), importName) && ownmodule != module)
+                    {
+                      bool already = false;
+                      bool applied;
+                      {
+                        SCOPED_LOCK(lock);
+                        applied = ApplyHook(*found, IATentry, already);
+                      }
+                    }
+                  }
+                }
+              }
+              else
+              {
+                missedOrdinals = true;
+              }
+
+              origFirst++;
+              first++;
+              continue;
+            }
+
+            IMAGE_IMPORT_BY_NAME *import =
+                (IMAGE_IMPORT_BY_NAME *)(baseAddress + origFirst->u1.AddressOfData);
+
+            const char *importName = (const char *)import->Name;
+
+            auto found = std::lower_bound(hookset->FunctionHooks.begin(),
+                                          hookset->FunctionHooks.end(), importName, hook_find());
+
+            if(found != hookset->FunctionHooks.end() &&
+               !strcmp(found->function.c_str(), importName) && ownmodule != module)
+            {
+              bool already = false;
+              bool applied;
+              {
+                SCOPED_LOCK(lock);
+                applied = ApplyHook(*found, IATentry, already);
+              }
+
+              if(applied && !already)
+              {
+                RDCLOG("ApplyHooks(%s): DELAY hooked %s!%s", lowername, dllName, importName);
+              }
+            }
+
+            origFirst++;
+            first++;
+          }
+        }
+
+        delayDesc++;
+      }
+    }
+
     FreeLibrary(refcountModHandle);
   }
 };
@@ -586,8 +711,14 @@ static void HookAllModules()
   if(!s_HookData->hookAll)
     return;
 
+  int moduleCount = 0;
   ForAllModules(
-      [](const MODULEENTRY32 &me32) { s_HookData->ApplyHooks(me32.szModule, me32.hModule); });
+      [&moduleCount](const MODULEENTRY32 &me32) {
+        moduleCount++;
+        s_HookData->ApplyHooks(me32.szModule, me32.hModule);
+      });
+
+  RDCLOG("HookAllModules: patched %d modules", moduleCount);
 
   // check if we're already in this section of code, and if so don't go in again.
   int32_t prev = Atomic::CmpExch32(&s_HookData->posthooking, 0, 1);
@@ -736,6 +867,14 @@ HMODULE WINAPI Hooked_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE fileHandle, D
   // was excluded from IAT patching
   HMODULE mod = LoadLibraryExW(lpLibFileName, fileHandle, flags);
 
+  // Log D3D-related LoadLibrary calls
+  if(lpLibFileName && (wcsstr(lpLibFileName, L"d3d11") || wcsstr(lpLibFileName, L"d3d12") ||
+     wcsstr(lpLibFileName, L"dxgi") || wcsstr(lpLibFileName, L"D3D11") ||
+     wcsstr(lpLibFileName, L"D3D12") || wcsstr(lpLibFileName, L"DXGI")))
+  {
+    RDCLOG("Hooked_LoadLibraryW(%ls) = %p", lpLibFileName, mod);
+  }
+
   DWORD err = GetLastError();
 
   if(dohook && mod && !IsAPISet(lpLibFileName))
@@ -765,6 +904,16 @@ FARPROC WINAPI Hooked_GetProcAddress(HMODULE mod, LPCSTR func)
 {
   if(mod == NULL || func == NULL || mod == s_HookData->ownmodule)
     return GetProcAddress(mod, func);
+
+  // Log D3D-related GetProcAddress calls for debugging
+  if(!OrdinalAsString((void *)func))
+  {
+    if(strstr(func, "D3D11") || strstr(func, "D3D12") || strstr(func, "DXGI") ||
+       strstr(func, "CreateDevice") || strstr(func, "CreateDXGI"))
+    {
+      RDCLOG("Hooked_GetProcAddress(%p, %s)", mod, func);
+    }
+  }
 
 #if ENABLED(VERBOSE_DEBUG_HOOK)
   if(OrdinalAsString((void *)func))
@@ -972,6 +1121,115 @@ void LibraryHooks::EndHookRegistration()
     HookAllModules();
 
     s_HookData->missedOrdinals = false;
+  }
+
+  // ======================================================================
+  // Apply inline hooks for D3D/DXGI functions using MinHook.
+  // UE5 Shipping builds bypass IAT entirely — they use GetProcAddress to
+  // cache raw function pointers. Inline hooks patch the actual function
+  // entry bytes so any call is intercepted regardless of how the pointer
+  // was obtained.
+  // ======================================================================
+  {
+    MH_STATUS mhInit = MH_Initialize();
+    if(mhInit != MH_OK && mhInit != MH_ERROR_ALREADY_INITIALIZED)
+    {
+      RDCERR("MH_Initialize failed: %d", (int)mhInit);
+    }
+    else
+    {
+      const char *inlineHookDlls[] = {"dxgi.dll", "d3d12.dll", "d3d11.dll"};
+
+      // Use the real kernel32 GetProcAddress, bypassing our own IAT hook.
+      // After HookAllModules(), our IAT GetProcAddress is Hooked_GetProcAddress which
+      // returns hook function pointers instead of the real function addresses.
+      HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+      typedef FARPROC(WINAPI *PFN_GetProcAddress)(HMODULE, LPCSTR);
+      PFN_GetProcAddress RealGetProcAddress =
+          (PFN_GetProcAddress)::GetProcAddress(hKernel32, "GetProcAddress");
+      // If our IAT hook already redirected GetProcAddress, fall back to kernel32 directly
+      if(!RealGetProcAddress)
+        RealGetProcAddress = ::GetProcAddress;
+
+      for(const char *dllName : inlineHookDlls)
+      {
+        auto it = s_HookData->DllHooks.find(dllName);
+        if(it == s_HookData->DllHooks.end() || it->second.module == NULL)
+          continue;
+
+        // If there are alt modules (e.g. a proxy DLL + the real System32 DLL both named
+        // "dxgi.dll"), prefer the System32 one for inline hooking. The proxy forwards calls
+        // to the real DLL, so we must hook the real DLL's function entry points.
+        HMODULE hookModule = it->second.module;
+        {
+          wchar_t sysDir[MAX_PATH];
+          GetSystemDirectoryW(sysDir, MAX_PATH);
+          size_t sysDirLen = wcslen(sysDir);
+
+          auto tryPreferSystem = [&](HMODULE mod) {
+            wchar_t modPath[MAX_PATH] = {};
+            GetModuleFileNameW(mod, modPath, MAX_PATH - 1);
+            // Check if this module path starts with the System32 directory
+            if(_wcsnicmp(modPath, sysDir, sysDirLen) == 0)
+            {
+              hookModule = mod;
+              return true;
+            }
+            return false;
+          };
+
+          if(!tryPreferSystem(hookModule))
+          {
+            for(size_t ai = 0; ai < it->second.altmodules.size(); ai++)
+            {
+              if(tryPreferSystem(it->second.altmodules[ai]))
+                break;
+            }
+          }
+        }
+
+        {
+          wchar_t modPath[MAX_PATH] = {};
+          GetModuleFileNameW(hookModule, modPath, MAX_PATH - 1);
+          RDCLOG("Inline hook: %s using module %p (%ls), altmodules=%zu",
+                 dllName, hookModule, modPath, it->second.altmodules.size());
+        }
+
+        for(FunctionHook &hook : it->second.FunctionHooks)
+        {
+          if(!hook.orig || !hook.hook)
+            continue;
+
+          // Always resolve from hookModule (which may be System32, not the proxy).
+          // *hook.orig may have been filled from ApplyHooks using a different module (the proxy),
+          // so we cannot trust it here.
+          void *target = (void *)GetProcAddress(hookModule, hook.function.c_str());
+
+          if(target == NULL || target == hook.hook)
+            continue;
+
+          void *trampoline = NULL;
+          MH_STATUS cr = MH_CreateHook(target, hook.hook, &trampoline);
+          if(cr != MH_OK)
+          {
+            RDCERR("MH_CreateHook failed for %s!%s: %d", dllName, hook.function.c_str(), (int)cr);
+            continue;
+          }
+
+          MH_STATUS en = MH_EnableHook(target);
+          if(en != MH_OK)
+          {
+            RDCERR("MH_EnableHook failed for %s!%s: %d", dllName, hook.function.c_str(), (int)en);
+            continue;
+          }
+
+          *hook.orig = trampoline;
+
+          RDCLOG("Inline hooked %s!%s (target=%p -> hook=%p, trampoline=%p)",
+                 dllName, hook.function.c_str(), target, hook.hook, trampoline);
+        }
+      }
+    }
   }
 }
 

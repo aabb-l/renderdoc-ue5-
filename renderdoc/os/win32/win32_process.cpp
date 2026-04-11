@@ -249,7 +249,7 @@ extern "C" __declspec(dllexport) void __cdecl INTERNAL_ApplyEnvMods(void *ignore
   Process::ApplyEnvironmentModification();
 }
 
-void InjectDLL(HANDLE hProcess, rdcwstr libName)
+void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
 {
   wchar_t dllPath[MAX_PATH + 1] = {0};
   wcscpy_s(dllPath, libName.c_str());
@@ -262,38 +262,188 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName)
     return;
   }
 
-  void *remoteMem =
-      VirtualAllocEx(hProcess, NULL, sizeof(dllPath), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-  if(remoteMem)
+  FARPROC loadLibraryW = GetProcAddress(kernel32, "LoadLibraryW");
+  if(loadLibraryW == NULL)
   {
-    BOOL success = WriteProcessMemory(hProcess, remoteMem, (void *)dllPath, sizeof(dllPath), NULL);
-    if(success)
+    RDCERR("Couldn't get LoadLibraryW address");
+    return;
+  }
+
+  // allocate remote memory: dllPath + shellcode
+  // shellcode layout (x64):
+  //   [0..MAX_PATH*2+2] = dllPath
+  //   [shellcodeOffset] = shellcode bytes
+  const SIZE_T pathSize = sizeof(dllPath);
+  const SIZE_T shellcodeSize = 64;
+  const SIZE_T totalSize = pathSize + shellcodeSize;
+  const SIZE_T shellcodeOffset = pathSize;
+
+  void *remoteMem = VirtualAllocEx(hProcess, NULL, totalSize, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if(!remoteMem)
+  {
+    RDCERR("Couldn't allocate remote memory for DLL '%ls': %u", libName.c_str(), GetLastError());
+    return;
+  }
+
+  // write dllPath into remote memory
+  if(!WriteProcessMemory(hProcess, remoteMem, (void *)dllPath, pathSize, NULL))
+  {
+    RDCERR("Couldn't write dllPath to remote memory: %u", GetLastError());
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    return;
+  }
+
+  // build x64 shellcode:
+  // sub rsp, 0x28              ; shadow space + align
+  // mov rcx, <dllPath addr>    ; arg1 = dllPath
+  // mov rax, <LoadLibraryW>    ; rax = LoadLibraryW
+  // call rax
+  // add rsp, 0x28
+  // jmp <original rip>         ; jump back (patched later)
+  uint8_t shellcode[64] = {0};
+  uintptr_t dllPathAddr = (uintptr_t)remoteMem;
+  uintptr_t loadLibAddr = (uintptr_t)loadLibraryW;
+
+  size_t i = 0;
+  // sub rsp, 0x28
+  shellcode[i++] = 0x48; shellcode[i++] = 0x83; shellcode[i++] = 0xEC; shellcode[i++] = 0x28;
+  // mov rcx, imm64
+  shellcode[i++] = 0x48; shellcode[i++] = 0xB9;
+  memcpy(&shellcode[i], &dllPathAddr, 8); i += 8;
+  // mov rax, imm64
+  shellcode[i++] = 0x48; shellcode[i++] = 0xB8;
+  memcpy(&shellcode[i], &loadLibAddr, 8); i += 8;
+  // call rax
+  shellcode[i++] = 0xFF; shellcode[i++] = 0xD0;
+  // add rsp, 0x28
+  shellcode[i++] = 0x48; shellcode[i++] = 0x83; shellcode[i++] = 0xC4; shellcode[i++] = 0x28;
+  // jmp back: filled in after we know original RIP (placeholder: jmp +0 = nop loop)
+  // will be: mov rax, <origRip>; jmp rax
+  shellcode[i++] = 0x48; shellcode[i++] = 0xB8; // mov rax, imm64 (origRip placeholder = 0)
+  size_t origRipOffset = i;
+  i += 8;
+  shellcode[i++] = 0xFF; shellcode[i++] = 0xE0; // jmp rax
+
+  // find the main thread of the target process via toolhelp snapshot
+  HANDLE hMainThread = NULL;
+  DWORD mainTid = 0;
+  ULONGLONG earliestCreate = ULLONG_MAX;
+
+  if(pid != 0)
+  {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if(hSnap != INVALID_HANDLE_VALUE)
     {
-      HANDLE hThread = CreateRemoteThread(
-          hProcess, NULL, 1024 * 1024U,
-          (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "LoadLibraryW"), remoteMem, 0, NULL);
-      if(hThread)
+      THREADENTRY32 te = {sizeof(te)};
+      if(Thread32First(hSnap, &te))
       {
-        WaitForSingleObject(hThread, INFINITE);
-        CloseHandle(hThread);
+        do
+        {
+          if(te.th32OwnerProcessID == pid)
+          {
+            HANDLE hT = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                       THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+                                   FALSE, te.th32ThreadID);
+            if(hT)
+            {
+              // pick thread with smallest creation time as main thread
+              FILETIME ct, et, kt, ut;
+              if(GetThreadTimes(hT, &ct, &et, &kt, &ut))
+              {
+                ULONGLONG ctime = ((ULONGLONG)ct.dwHighDateTime << 32) | ct.dwLowDateTime;
+                if(ctime < earliestCreate)
+                {
+                  if(hMainThread)
+                    CloseHandle(hMainThread);
+                  earliestCreate = ctime;
+                  hMainThread = hT;
+                  mainTid = te.th32ThreadID;
+                }
+                else
+                {
+                  CloseHandle(hT);
+                }
+              }
+              else
+              {
+                CloseHandle(hT);
+              }
+            }
+          }
+        } while(Thread32Next(hSnap, &te));
       }
-      else
+      CloseHandle(hSnap);
+    }
+  }
+
+  if(hMainThread)
+  {
+    // suspend main thread and hijack RIP
+    SuspendThread(hMainThread);
+
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_FULL;
+    if(GetThreadContext(hMainThread, &ctx))
+    {
+      uintptr_t origRip = ctx.Rip;
+
+      // patch origRip into shellcode
+      memcpy(&shellcode[origRipOffset], &origRip, 8);
+
+      // write shellcode
+      uintptr_t shellcodeAddr = (uintptr_t)remoteMem + shellcodeOffset;
+      WriteProcessMemory(hProcess, (void *)shellcodeAddr, shellcode, shellcodeSize, NULL);
+
+      // redirect RIP to shellcode
+      ctx.Rip = shellcodeAddr;
+      SetThreadContext(hMainThread, &ctx);
+
+      ResumeThread(hMainThread);
+
+      // wait for shellcode to run (DLL loaded) — poll until RIP returns to original
+      for(int w = 0; w < 2000; w++)
       {
-        RDCERR("Couldn't create remote thread for LoadLibraryW: %u", GetLastError());
+        Sleep(5);
+        SuspendThread(hMainThread);
+        CONTEXT ctx2 = {};
+        ctx2.ContextFlags = CONTEXT_CONTROL;
+        GetThreadContext(hMainThread, &ctx2);
+        if(ctx2.Rip == origRip || ctx2.Rip < (uintptr_t)remoteMem ||
+           ctx2.Rip >= (uintptr_t)remoteMem + totalSize)
+        {
+          // shellcode finished
+          ResumeThread(hMainThread);
+          break;
+        }
+        ResumeThread(hMainThread);
       }
     }
     else
     {
-      RDCERR("Couldn't write remote memory %p with dllPath '%ls': %u", remoteMem, dllPath,
-             GetLastError());
+      RDCERR("GetThreadContext failed: %u", GetLastError());
+      ResumeThread(hMainThread);
     }
 
-    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    CloseHandle(hMainThread);
   }
   else
   {
-    RDCERR("Couldn't allocate remote memory for DLL '%ls': %u", libName.c_str(), GetLastError());
+    // fallback: CreateRemoteThread
+    HANDLE hThread = CreateRemoteThread(
+        hProcess, NULL, 1024 * 1024U,
+        (LPTHREAD_START_ROUTINE)loadLibraryW, remoteMem, 0, NULL);
+    if(hThread)
+    {
+      WaitForSingleObject(hThread, INFINITE);
+      CloseHandle(hThread);
+    }
+    else
+    {
+      RDCERR("Couldn't create remote thread for LoadLibraryW: %u", GetLastError());
+    }
   }
+
+  VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
 }
 
 uintptr_t FindRemoteDLL(DWORD pid, rdcstr libName)
@@ -717,7 +867,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
     }
   }
 #else
-  // farm off to alternate bitness renderdoccmd.exe
+  // farm off to alternate bitness rendertestcmd.exe
 
   // if the target process is 'wow64' that means it's 32-bit.
   capalt = (isWow64 == TRUE);
@@ -735,7 +885,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
       renderdocPath[idx] = 0;
 
-      wcscat_s(renderdocPath, L"\\Win32\\Development\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\Win32\\Development\\rendertestcmd.exe");
     }
 
     if(!devLocation)
@@ -748,7 +898,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
         renderdocPath[idx] = 0;
 
-        wcscat_s(renderdocPath, L"\\Win32\\Release\\renderdoccmd.exe");
+        wcscat_s(renderdocPath, L"\\Win32\\Release\\rendertestcmd.exe");
       }
     }
 
@@ -763,7 +913,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
         *slash = 0;
 
       // append path
-      wcscat_s(renderdocPath, L"\\x86\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\x86\\rendertestcmd.exe");
     }
 #else
     // if it looks like we're in the development environment, look for the alternate bitness in the
@@ -775,7 +925,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
       renderdocPath[idx] = 0;
 
-      wcscat_s(renderdocPath, L"\\x64\\Development\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\x64\\Development\\rendertestcmd.exe");
     }
 
     if(!devLocation)
@@ -788,7 +938,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
         renderdocPath[idx] = 0;
 
-        wcscat_s(renderdocPath, L"\\x64\\Release\\renderdoccmd.exe");
+        wcscat_s(renderdocPath, L"\\x64\\Release\\rendertestcmd.exe");
       }
     }
 
@@ -808,7 +958,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
         *slash = 0;
 
       // append path
-      wcscat_s(renderdocPath, L"\\renderdoccmd.exe");
+      wcscat_s(renderdocPath, L"\\rendertestcmd.exe");
     }
 #endif
 
@@ -970,7 +1120,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
     return {ResultCode::Succeeded, (uint32_t)exitCode};
   }
 
-  InjectDLL(hProcess, renderdocPath);
+  InjectDLL(hProcess, renderdocPath, pid);
 
   const char *rdoc_dll = STRINGIZE(RDOC_BASE_NAME);
 
@@ -1497,8 +1647,8 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
   renderdocPath = get_dirname(renderdocPath);
 
-  // the native renderdoccmd.exe is always next to the dll. Wow32 will be somewhere else
-  rdcstr cmdpathNative = renderdocPath + "\\renderdoccmd.exe";
+  // the native rendertestcmd.exe is always next to the dll. Wow32 will be somewhere else
+  rdcstr cmdpathNative = renderdocPath + "\\rendertestcmd.exe";
   rdcstr cmdpathWow32;
 
   rdcstr shimpathNative = renderdocPath;
@@ -1506,8 +1656,8 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
 
 #if ENABLED(RDOC_X64)
 
-  // native shim is just renderdocshim64.dll
-  shimpathNative = renderdocPath + "\\renderdocshim64.dll";
+  // native shim is just rendertestshim64.dll
+  shimpathNative = renderdocPath + "\\rendertestshim64.dll";
 
   // if it looks like we're in the development environment, look for the alternate bitness in the
   // corresponding folder
@@ -1516,8 +1666,8 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
   {
     renderdocPath.erase(devLocation, ~0U);
 
-    shimpathWow32 = renderdocPath + "\\Win32\\Development\\renderdocshim32.dll";
-    cmdpathWow32 = renderdocPath + "\\Win32\\Development\\renderdoccmd.exe";
+    shimpathWow32 = renderdocPath + "\\Win32\\Development\\rendertestshim32.dll";
+    cmdpathWow32 = renderdocPath + "\\Win32\\Development\\rendertestcmd.exe";
   }
   else
   {
@@ -1527,22 +1677,22 @@ RDResult Process::StartGlobalHook(const rdcstr &pathmatch, const rdcstr &capture
     {
       renderdocPath.erase(devLocation, ~0U);
 
-      shimpathWow32 = renderdocPath + "\\Win32\\Release\\renderdocshim32.dll";
-      cmdpathWow32 = renderdocPath + "\\Win32\\Release\\renderdoccmd.exe";
+      shimpathWow32 = renderdocPath + "\\Win32\\Release\\rendertestshim32.dll";
+      cmdpathWow32 = renderdocPath + "\\Win32\\Release\\rendertestcmd.exe";
     }
   }
 
   // if we're not in the dev environment, assume it's under a x86\ subfolder
   if(devLocation < 0)
   {
-    shimpathWow32 = renderdocPath + "\\x86\\renderdocshim32.dll";
-    cmdpathWow32 = renderdocPath + "\\x86\\renderdoccmd.exe";
+    shimpathWow32 = renderdocPath + "\\x86\\rendertestshim32.dll";
+    cmdpathWow32 = renderdocPath + "\\x86\\rendertestcmd.exe";
   }
 
 #else
 
   // nothing fancy to do here for 32-bit, just point the shim next to our dll.
-  shimpathNative = renderdocPath + "\\renderdocshim32.dll";
+  shimpathNative = renderdocPath + "\\rendertestshim32.dll";
 
 #endif
 

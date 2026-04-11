@@ -272,10 +272,12 @@ private:
 
   static HRESULT WINAPI CreateDXGIFactory_hook(__in REFIID riid, __out void **ppFactory)
   {
+    RDCLOG(">>> CreateDXGIFactory_hook ENTERED");
     if(ppFactory)
       *ppFactory = NULL;
     HRESULT ret = dxgihooks.CreateDXGIFactory()(riid, ppFactory);
 
+    RDCLOG(">>> CreateDXGIFactory_hook: real returned 0x%08X, factory=%p", (unsigned)ret, ppFactory ? *ppFactory : NULL);
     if(SUCCEEDED(ret))
       RefCountDXGIObject::HandleWrap("CreateDXGIFactory", riid, ppFactory);
 
@@ -284,10 +286,12 @@ private:
 
   static HRESULT WINAPI CreateDXGIFactory1_hook(__in REFIID riid, __out void **ppFactory)
   {
+    RDCLOG(">>> CreateDXGIFactory1_hook ENTERED");
     if(ppFactory)
       *ppFactory = NULL;
     HRESULT ret = dxgihooks.CreateDXGIFactory1()(riid, ppFactory);
 
+    RDCLOG(">>> CreateDXGIFactory1_hook: real returned 0x%08X, factory=%p", (unsigned)ret, ppFactory ? *ppFactory : NULL);
     if(SUCCEEDED(ret))
       RefCountDXGIObject::HandleWrap("CreateDXGIFactory1", riid, ppFactory);
 
@@ -296,10 +300,12 @@ private:
 
   static HRESULT WINAPI CreateDXGIFactory2_hook(UINT Flags, REFIID riid, void **ppFactory)
   {
+    RDCLOG(">>> CreateDXGIFactory2_hook ENTERED (Flags=0x%x)", Flags);
     if(ppFactory)
       *ppFactory = NULL;
     HRESULT ret = dxgihooks.CreateDXGIFactory2()(Flags, riid, ppFactory);
 
+    RDCLOG(">>> CreateDXGIFactory2_hook: real returned 0x%08X, factory=%p", (unsigned)ret, ppFactory ? *ppFactory : NULL);
     if(SUCCEEDED(ret))
       RefCountDXGIObject::HandleWrap("CreateDXGIFactory2", riid, ppFactory);
 
