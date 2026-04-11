@@ -6,6 +6,41 @@
 
 RenderDoc is a frame-capture based graphics debugger, currently available for Vulkan, D3D11, D3D12, OpenGL, and OpenGL ES development on Windows, Linux, Android, and Nintendo Switch&trade;. It is completely open-source under the MIT license.
 
+---
+
+## 魔改版说明（ACE 反外挂绕过 · UE5 D3D12）
+
+本分支在原版 RenderDoc 基础上进行了魔改，目标是绕过 ACE（Anti-Cheat Expert）反外挂系统，实现对 UE5 D3D12 游戏的截帧调试。
+
+### 核心改动
+
+| 改动 | 说明 |
+| --- | --- |
+| **全局特征重命名** | `renderdoc` → `rendertest`，覆盖 DLL 名、导出符号、窗口类名、共享内存等约 40 处 |
+| **新增 `version_proxy/`** | `dxgi.dll` proxy DLL，DllMain 中缓存真实函数指针、磁盘重命名 + PEB 模块名伪装，绕过 ACE 检测 |
+| **`win32_hook.cpp`** | inline hook 安装时优先选择 System32 模块（而非同名 proxy），并直接重新获取函数地址 |
+| **`win32_process.cpp`** | 新增 `SetThreadContext` 线程劫持注入方式（fallback 到 `CreateRemoteThread`） |
+| **新增 `process_injector/`** | 独立注入测试工具 |
+| **新增 `renderdoc/3rdparty/minhook`** | 作为 submodule 引入 [TsudaKageyu/minhook](https://github.com/TsudaKageyu/minhook) |
+| **VS 工具集升级** | 各 `.vcxproj` 工具集升级至 v143（VS2022），输出文件名对应重命名 |
+
+### 文档
+
+- [使用指引](doc/使用指引.md) — 编译、部署、截帧操作步骤
+- [技术文档](doc/技术文档.md) — 绕过思路、hook 原理、注入机制详解
+- [魔改RenderDoc 开发记录](doc/魔改RenderDoc) — 完整开发过程记录
+- [鸣潮RenderDoc](doc/鸣潮RenderDoc.md) — 鸣潮游戏适配说明
+
+### 构建产物
+
+编译环境：VS2022，工具集 v143，Release x64
+
+- `dxgi.dll` — proxy DLL（`version_proxy` 项目）
+- `rendertest.dll` — RenderDoc 核心 DLL（`renderdoc` 项目）
+- `qrendertest.exe` — 截帧 UI 工具（`qrenderdoc` 项目）
+
+---
+
 RenderDoc is intended for debugging your own programs only. Any discussion of capturing programs that you did not create will not be allowed in any official public RenderDoc setting, including the issue tracker, discord, or via email. For example this includes capturing commercial games that you did not create, or capturing Google Maps or Google Earth. Note: Capturing projects you created that use a third party engine like Unreal or Unity, or open source and free projects is completely fine and supported.
 
 If you have any questions, suggestions or problems or you can [create an issue](https://github.com/baldurk/renderdoc/issues/new/choose) here on github, [email me directly](mailto:baldurk@baldurk.org) or come into [IRC](https://webchat.oftc.net/?channels=renderdoc) or [Discord](https://discord.gg/ahq6yRB) to discuss it.
