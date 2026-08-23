@@ -24,6 +24,7 @@
  ******************************************************************************/
 
 #include <winsock2.h>
+#include <shellapi.h>
 #include "core/core.h"
 #include "hooks/hooks.h"
 #include "os/os_specific.h"
@@ -70,6 +71,9 @@ typedef BOOL(WINAPI *PFN_CREATE_PROCESS_WITH_LOGON_W)(LPCWSTR lpUsername, LPCWST
                                                       LPSTARTUPINFOW lpStartupInfo,
                                                       LPPROCESS_INFORMATION lpProcessInformation);
 
+typedef BOOL(WINAPI *PFN_SHELL_EXECUTE_EX_A)(SHELLEXECUTEINFOA *pExecInfo);
+typedef BOOL(WINAPI *PFN_SHELL_EXECUTE_EX_W)(SHELLEXECUTEINFOW *pExecInfo);
+
 class SysHook : LibraryHook
 {
 public:
@@ -90,6 +94,10 @@ public:
     LibraryHooks::RegisterLibraryHook("api-ms-win-core-processthreads-l1-1-1.dll", NULL);
     LibraryHooks::RegisterLibraryHook("api-ms-win-core-processthreads-l1-1-2.dll", NULL);
     LibraryHooks::RegisterLibraryHook("ws2_32.dll", NULL);
+    LibraryHooks::RegisterLibraryHook("shell32.dll", NULL);
+
+    ShellExecuteExA.Register("shell32.dll", "ShellExecuteExA", ShellExecuteExA_hook);
+    ShellExecuteExW.Register("shell32.dll", "ShellExecuteExW", ShellExecuteExW_hook);
 
     // we want to hook CreateProcess purely so that we can recursively insert our hooks (if we so
     // wish)
@@ -167,6 +175,9 @@ private:
   HookedFunction<PFN_CREATE_PROCESS_AS_USER_W> API112CreateProcessAsUserW;
 
   HookedFunction<PFN_CREATE_PROCESS_WITH_LOGON_W> CreateProcessWithLogonW;
+
+  HookedFunction<PFN_SHELL_EXECUTE_EX_A> ShellExecuteExA;
+  HookedFunction<PFN_SHELL_EXECUTE_EX_W> ShellExecuteExW;
 
   HookedFunction<PFN_WSASTARTUP> WSAStartup;
   HookedFunction<PFN_WSACLEANUP> WSACleanup;
@@ -324,34 +335,24 @@ private:
     return ret;
   }
 
+  static bool ShouldSkipChildProcess(const rdcstr &text)
+  {
+    return text.contains("rendertestcmd.exe") || text.contains("qrendertest.exe") ||
+           text.contains("renderdoccmd.exe") || text.contains("qrenderdoc.exe") ||
+           text.contains("ntebrowser.exe") || text.contains("ntewebbooster.exe") ||
+           text.contains("crashclientreporter.exe");
+  }
+
   static bool ShouldInject(LPCWSTR lpApplicationName, LPCWSTR lpCommandLine)
   {
     if(!RenderDoc::Inst().GetCaptureOptions().hookIntoChildren)
       return false;
 
     bool inject = true;
-
-    // sanity check to make sure we're not going to go into an infinity loop injecting into
-    // ourselves.
     if(lpApplicationName)
-    {
-      rdcstr app = strlower(StringFormat::Wide2UTF8(lpApplicationName));
-
-      if(app.contains("rendertestcmd.exe") || app.contains("qrendertest.exe"))
-      {
-        inject = false;
-      }
-    }
+      inject &= !ShouldSkipChildProcess(strlower(StringFormat::Wide2UTF8(lpApplicationName)));
     if(lpCommandLine)
-    {
-      rdcstr cmd = strlower(StringFormat::Wide2UTF8(lpCommandLine));
-
-      if(cmd.contains("rendertestcmd.exe") || cmd.contains("qrendertest.exe"))
-      {
-        inject = false;
-      }
-    }
-
+      inject &= !ShouldSkipChildProcess(strlower(StringFormat::Wide2UTF8(lpCommandLine)));
     return inject;
   }
 
@@ -596,6 +597,71 @@ private:
         },
         dwCreationFlags, ShouldInject(lpApplicationName, lpCommandLine), lpEnvironment,
         lpProcessInformation);
+  }
+
+  static void InjectShellExecuteChild(const char *entryPoint, DWORD processId)
+  {
+    if(processId == 0)
+      return;
+    rdcpair<RDResult, uint32_t> res = Process::InjectIntoProcess(
+        processId, {}, RenderDoc::Inst().GetCaptureFileTemplate(), RenderDoc::Inst().GetCaptureOptions(),
+        false);
+    if(res.first == ResultCode::Succeeded)
+      RenderDoc::Inst().AddChildProcess((uint32_t)processId, res.second);
+    else
+      RDCWARN("%s child process injection failed, pid=%u", entryPoint, processId);
+  }
+
+  static BOOL WINAPI ShellExecuteExW_hook(SHELLEXECUTEINFOW *pExecInfo)
+  {
+    bool recursive = syshooks.CheckRecurse();
+    if(recursive)
+      return syshooks.ShellExecuteExW()(pExecInfo);
+    const bool inject = pExecInfo && ShouldInject(pExecInfo->lpFile, pExecInfo->lpParameters);
+    const ULONG originalMask = pExecInfo ? pExecInfo->fMask : 0;
+    const bool addedProcessHandle = inject && pExecInfo && (originalMask & SEE_MASK_NOCLOSEPROCESS) == 0;
+    if(addedProcessHandle)
+      pExecInfo->fMask |= SEE_MASK_NOCLOSEPROCESS;
+    BOOL ret = syshooks.ShellExecuteExW()(pExecInfo);
+    if(ret && inject && pExecInfo && pExecInfo->hProcess)
+      InjectShellExecuteChild("ShellExecuteExW", GetProcessId(pExecInfo->hProcess));
+    if(addedProcessHandle && pExecInfo)
+    {
+      if(pExecInfo->hProcess)
+      {
+        CloseHandle(pExecInfo->hProcess);
+        pExecInfo->hProcess = NULL;
+      }
+      pExecInfo->fMask = originalMask;
+    }
+    syshooks.EndRecurse();
+    return ret;
+  }
+
+  static BOOL WINAPI ShellExecuteExA_hook(SHELLEXECUTEINFOA *pExecInfo)
+  {
+    bool recursive = syshooks.CheckRecurse();
+    if(recursive)
+      return syshooks.ShellExecuteExA()(pExecInfo);
+    const bool inject = pExecInfo && ShouldInject(pExecInfo->lpFile, pExecInfo->lpParameters);
+    const ULONG originalMask = pExecInfo ? pExecInfo->fMask : 0;
+    const bool addedProcessHandle = inject && pExecInfo && (originalMask & SEE_MASK_NOCLOSEPROCESS) == 0;
+    if(addedProcessHandle)
+      pExecInfo->fMask |= SEE_MASK_NOCLOSEPROCESS;
+    BOOL ret = syshooks.ShellExecuteExA()(pExecInfo);
+    if(ret && inject && pExecInfo && pExecInfo->hProcess)
+      InjectShellExecuteChild("ShellExecuteExA", GetProcessId(pExecInfo->hProcess));
+    if(addedProcessHandle && pExecInfo)
+    {
+      if(pExecInfo->hProcess)
+      {
+        CloseHandle(pExecInfo->hProcess);
+        pExecInfo->hProcess = NULL;
+      }
+      pExecInfo->fMask = originalMask;
+    }
+    syshooks.EndRecurse();
+    return ret;
   }
 
   static BOOL WINAPI API112CreateProcessAsUserW_hook(
