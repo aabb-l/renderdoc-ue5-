@@ -67,7 +67,8 @@ void StopGlobalHook();
 rdcpair<RDResult, uint32_t> InjectIntoProcess(uint32_t pid,
                                               const rdcarray<EnvironmentModification> &env,
                                               const rdcstr &capturefile, const CaptureOptions &opts,
-                                              bool waitForExit);
+                                              bool waitForExit,
+                                              bool processIsSuspended = false);
 struct ProcessResult
 {
   rdcstr strStdout, strStderror;

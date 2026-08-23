@@ -28,6 +28,13 @@
 #include <replay/version.h>
 #include <string>
 
+// Internal entry point used only by the alternate-bitness helper. The public injection API keeps
+// its existing ABI and always treats attached processes as already running.
+extern "C" RENDERDOC_API ExecuteResult RENDERDOC_CC
+RENDERDOC_InternalInjectIntoProcess(uint32_t pid, const rdcarray<EnvironmentModification> &env,
+                                    const rdcstr &capturefile, const CaptureOptions &opts,
+                                    bool waitForExit, bool processIsSuspended);
+
 rdcstr conv(const std::string &s)
 {
   return rdcstr(s.c_str(), s.size());
@@ -916,6 +923,7 @@ private:
   std::string debuglog;
   uint32_t pid;
   std::string capfile;
+  bool processIsSuspended = false;
 
 public:
   CapAltBitCommand() : Command() {}
@@ -925,6 +933,7 @@ public:
     parser.add<std::string>("capfile", 0, "");
     parser.add<std::string>("debuglog", 0, "");
     parser.add<std::string>("capopts", 0, "");
+    parser.add<uint32_t>("process-suspended", 0, "");
     parser.stop_at_rest(true);
   }
   virtual const char *Description() { return "Internal use only!"; }
@@ -1012,6 +1021,7 @@ public:
     debuglog = parser.get<std::string>("debuglog");
     pid = parser.get<uint32_t>("pid");
     capfile = parser.get<std::string>("capfile");
+    processIsSuspended = parser.get<uint32_t>("process-suspended") != 0;
 
     return true;
   }
@@ -1019,7 +1029,8 @@ public:
   {
     RENDERDOC_SetDebugLogFile(conv(debuglog));
 
-    ExecuteResult result = RENDERDOC_InjectIntoProcess(pid, env, conv(capfile), cmdopts, false);
+    ExecuteResult result = RENDERDOC_InternalInjectIntoProcess(
+        pid, env, conv(capfile), cmdopts, false, processIsSuspended);
 
     if(result.result.OK())
       return result.ident;

@@ -1,17 +1,19 @@
-// dxgi_proxy.cpp — dxgi.dll proxy with PEB module name masquerade
+// dxgi_proxy.cpp — dxgi.dll proxy with RenderDoc payload loading and legacy masquerade
 //
 // Strategy:
 // 1. Game calls LoadLibrary("dxgi.dll") → loads this proxy from game directory
-// 2. DllMain pre-loads System32 dxgi/d3d12/d3d11, caches real function pointers,
-//    loads rendertest.dll (RenderDoc hooks installed)
-// 3. Renames own module entry in the PEB from "dxgi.dll" to "mfplat.dll"
-//    so ACE's module name scan does not find "dxgi.dll" in the loaded modules list
-// 4. Proxy exports forward to System32 dxgi.dll (already inline-hooked by RenderDoc)
+// 2. DllMain only loads System32 dxgi.dll and caches real function pointers
+// 3. DllMain preloads System32 d3d12.dll and loads rendertest.dll from this DLL's directory
+// 4. Proxy exports forward to System32 dxgi.dll
+// 5. The proxy renames its disk image, rewrites its PEB loader names, and records proxy.log
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <winternl.h>
 #include <stdio.h>
+#include <stdarg.h>
+
+#include "../renderdoc/api/app/renderdoc_app.h"
 
 // ---- logging ----
 static FILE *g_log = NULL;
@@ -20,6 +22,7 @@ static void LogMsg(const char *fmt, ...)
 {
     if(!g_log)
         return;
+
     va_list args;
     va_start(args, fmt);
     vfprintf(g_log, fmt, args);
@@ -28,8 +31,8 @@ static void LogMsg(const char *fmt, ...)
 }
 
 // ---- PEB module name masquerade ----
-// winternl.h only exposes InMemoryOrderModuleList.
-// We define our own full PEB_LDR_DATA and LDR_DATA_TABLE_ENTRY.
+// winternl.h only exposes part of these loader structures, so keep the
+// minimal prefixes needed to traverse InLoadOrderModuleList.
 typedef struct _MY_PEB_LDR_DATA
 {
     ULONG Length;
@@ -52,7 +55,23 @@ typedef struct _MY_LDR_DATA_TABLE_ENTRY
     UNICODE_STRING BaseDllName;
 } MY_LDR_DATA_TABLE_ENTRY;
 
-static void MasqueradeModuleName(HMODULE hModule, const wchar_t *newBaseName, const wchar_t *newFullPath)
+static wchar_t g_masqueradeBaseName[64] = {};
+static wchar_t g_masqueradeFullPath[MAX_PATH] = {};
+static UNICODE_STRING g_originalBaseDllName = {};
+static UNICODE_STRING g_originalFullDllName = {};
+static BOOL g_hasOriginalModuleNames = FALSE;
+
+static void AssignOwnedUnicodeString(UNICODE_STRING &target, wchar_t *storage,
+                                     size_t storageCount, const wchar_t *value)
+{
+    wcscpy_s(storage, storageCount, value);
+    target.Buffer = storage;
+    target.Length = (USHORT)(wcslen(storage) * sizeof(wchar_t));
+    target.MaximumLength = (USHORT)(storageCount * sizeof(wchar_t));
+}
+
+static void MasqueradeModuleName(HMODULE hModule, const wchar_t *newBaseName,
+                                 const wchar_t *newFullPath)
 {
 #ifdef _WIN64
     PPEB peb = (PPEB)__readgsqword(0x60);
@@ -60,40 +79,136 @@ static void MasqueradeModuleName(HMODULE hModule, const wchar_t *newBaseName, co
     PPEB peb = (PPEB)__readfsdword(0x30);
 #endif
 
+    if(!peb || !peb->Ldr)
+    {
+        LogMsg("[dxgi_proxy] PEB masquerade: loader data unavailable\n");
+        return;
+    }
+
     MY_PEB_LDR_DATA *ldr = (MY_PEB_LDR_DATA *)peb->Ldr;
     LIST_ENTRY *head = &ldr->InLoadOrderModuleList;
     LIST_ENTRY *curr = head->Flink;
 
-    while(curr != head)
+    while(curr && curr != head)
     {
-        MY_LDR_DATA_TABLE_ENTRY *entry = CONTAINING_RECORD(curr, MY_LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+        MY_LDR_DATA_TABLE_ENTRY *entry =
+            CONTAINING_RECORD(curr, MY_LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
 
         if(entry->DllBase == (PVOID)hModule)
         {
-            // Overwrite BaseDllName
-            size_t baseLen = wcslen(newBaseName) * sizeof(wchar_t);
-            if(baseLen <= entry->BaseDllName.MaximumLength)
+            if(!g_hasOriginalModuleNames)
             {
-                memset(entry->BaseDllName.Buffer, 0, entry->BaseDllName.MaximumLength);
-                memcpy(entry->BaseDllName.Buffer, newBaseName, baseLen);
-                entry->BaseDllName.Length = (USHORT)baseLen;
+                g_originalBaseDllName = entry->BaseDllName;
+                g_originalFullDllName = entry->FullDllName;
+                g_hasOriginalModuleNames = TRUE;
             }
 
-            // Overwrite FullDllName
-            size_t fullLen = wcslen(newFullPath) * sizeof(wchar_t);
-            if(fullLen <= entry->FullDllName.MaximumLength)
-            {
-                memset(entry->FullDllName.Buffer, 0, entry->FullDllName.MaximumLength);
-                memcpy(entry->FullDllName.Buffer, newFullPath, fullLen);
-                entry->FullDllName.Length = (USHORT)fullLen;
-            }
-
+            AssignOwnedUnicodeString(entry->BaseDllName, g_masqueradeBaseName,
+                                     sizeof(g_masqueradeBaseName) / sizeof(g_masqueradeBaseName[0]),
+                                     newBaseName);
+            AssignOwnedUnicodeString(entry->FullDllName, g_masqueradeFullPath,
+                                     sizeof(g_masqueradeFullPath) / sizeof(g_masqueradeFullPath[0]),
+                                     newFullPath);
             LogMsg("[dxgi_proxy] PEB masquerade: renamed to '%ls'\n", newBaseName);
             return;
         }
+
         curr = curr->Flink;
     }
-    LogMsg("[dxgi_proxy] PEB masquerade: module %p not found in PEB!\n", (void*)hModule);
+
+    LogMsg("[dxgi_proxy] PEB masquerade: module %p not found in PEB!\n", (void *)hModule);
+}
+
+static void RestoreModuleName(HMODULE hModule)
+{
+    if(!g_hasOriginalModuleNames)
+        return;
+
+#ifdef _WIN64
+    PPEB peb = (PPEB)__readgsqword(0x60);
+#else
+    PPEB peb = (PPEB)__readfsdword(0x30);
+#endif
+
+    if(!peb || !peb->Ldr)
+        return;
+
+    MY_PEB_LDR_DATA *ldr = (MY_PEB_LDR_DATA *)peb->Ldr;
+    LIST_ENTRY *head = &ldr->InLoadOrderModuleList;
+    LIST_ENTRY *curr = head->Flink;
+
+    while(curr && curr != head)
+    {
+        MY_LDR_DATA_TABLE_ENTRY *entry =
+            CONTAINING_RECORD(curr, MY_LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+
+        if(entry->DllBase == (PVOID)hModule)
+        {
+            entry->BaseDllName = g_originalBaseDllName;
+            entry->FullDllName = g_originalFullDllName;
+            g_hasOriginalModuleNames = FALSE;
+            LogMsg("[dxgi_proxy] PEB masquerade: original loader names restored\n");
+            return;
+        }
+
+        curr = curr->Flink;
+    }
+}
+
+static void BuildRealDxgiPath(wchar_t *path, size_t pathCount, const wchar_t *sysDir)
+{
+    wcscpy_s(path, pathCount, sysDir);
+    wcscat_s(path, pathCount, L"\\");
+    wcscat_s(path, pathCount, L"dxgi.dll");
+}
+
+static void BuildSystemD3D12Path(wchar_t *path, size_t pathCount, const wchar_t *sysDir)
+{
+    wcscpy_s(path, pathCount, sysDir);
+    wcscat_s(path, pathCount, L"\\");
+    wcscat_s(path, pathCount, L"d3d12.dll");
+}
+
+static void BuildSiblingRenderTestPath(wchar_t *path, size_t pathCount, HMODULE selfModule)
+{
+    GetModuleFileNameW(selfModule, path, (DWORD)pathCount);
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if(slash)
+        *(slash + 1) = L'\0';
+    else if(pathCount > 0)
+        path[0] = L'\0';
+    wcscat_s(path, pathCount, L"rendertest.dll");
+}
+
+static void EnableRenderDocUnsupportedVendorExtensions(HMODULE renderTestModule)
+{
+    if(!renderTestModule)
+        return;
+
+    pRENDERDOC_GetAPI getAPI =
+        (pRENDERDOC_GetAPI)GetProcAddress(renderTestModule, "RENDERDOC_GetAPI");
+    if(!getAPI)
+    {
+        LogMsg("[dxgi_proxy] Capture options: RENDERDOC_GetAPI unavailable\n");
+        return;
+    }
+
+    RENDERDOC_API_1_6_0 *api = NULL;
+    if(!getAPI(eRENDERDOC_API_Version_1_6_0, (void **)&api) || !api ||
+       !api->SetCaptureOptionU32)
+    {
+        LogMsg("[dxgi_proxy] Capture options: API 1.6.0 unavailable\n");
+        return;
+    }
+
+    // This option expects an IHV vendor ID. Enable NVIDIA NvAPI passthrough.
+    const int vendorResult = api->SetCaptureOptionU32(
+        eRENDERDOC_Option_AllowUnsupportedVendorExtensions, 0x10DE);
+    const int childResult =
+        api->SetCaptureOptionU32(eRENDERDOC_Option_HookIntoChildren, 1);
+
+    LogMsg("[dxgi_proxy] Capture options: NVIDIA=%s, HookIntoChildren=1 (%s)\n",
+           vendorResult ? "OK" : "FAIL", childResult ? "OK" : "FAIL");
 }
 
 // ---- real dxgi.dll cached pointers ----
@@ -150,14 +265,8 @@ static void CacheAllRealProcs()
     g_real_UpdateHMDEmulationStatus          = (PFN_Generic)GetProcAddress(g_hRealDxgi, "UpdateHMDEmulationStatus");
 
     LogMsg("[dxgi_proxy] Cached CreateDXGIFactory=%p, Factory1=%p, Factory2=%p\n",
-           (void*)g_real_CreateDXGIFactory, (void*)g_real_CreateDXGIFactory1, (void*)g_real_CreateDXGIFactory2);
-}
-
-static bool IsGameProcess()
-{
-    wchar_t exeName[MAX_PATH];
-    GetModuleFileNameW(NULL, exeName, MAX_PATH);
-    return wcsstr(exeName, L"NRC-Win64-Shipping") != NULL;
+           (void *)g_real_CreateDXGIFactory, (void *)g_real_CreateDXGIFactory1,
+           (void *)g_real_CreateDXGIFactory2);
 }
 
 // ---- DllMain ----
@@ -169,81 +278,78 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 
         wchar_t logPath[MAX_PATH];
         GetModuleFileNameW(NULL, logPath, MAX_PATH);
-        wchar_t *s = wcsrchr(logPath, L'\\');
-        if(s)
-            *(s + 1) = L'\0';
+        wchar_t *logSlash = wcsrchr(logPath, L'\\');
+        if(logSlash)
+            *(logSlash + 1) = L'\0';
+        else
+            logPath[0] = L'\0';
         wcscat_s(logPath, L"proxy.log");
-        g_log = _wfopen(logPath, L"a");
+        _wfopen_s(&g_log, logPath, L"a");
 
-        LogMsg("\n[dxgi_proxy] === DllMain ATTACH (module=%p) ===\n", (void*)hModule);
+        LogMsg("\n[dxgi_proxy] === DllMain ATTACH (module=%p) ===\n", (void *)hModule);
 
-        // Step 1: Load real System32 DLLs
+        // Capture paths before changing the loader entry. GetModuleFileNameW(hModule)
+        // can observe the rewritten FullDllName after the PEB masquerade.
+        wchar_t renderTestPath[MAX_PATH];
+        BuildSiblingRenderTestPath(renderTestPath, MAX_PATH, hModule);
+
+        wchar_t oldPath[MAX_PATH];
+        GetModuleFileNameW(hModule, oldPath, MAX_PATH);
+
+        // Step 1: Load the real System32 graphics DLLs.
         wchar_t sysDir[MAX_PATH];
         GetSystemDirectoryW(sysDir, MAX_PATH);
         wchar_t path[MAX_PATH];
 
-        wsprintfW(path, L"%s\\dxgi.dll", sysDir);
+        BuildRealDxgiPath(path, MAX_PATH, sysDir);
         g_hRealDxgi = LoadLibraryW(path);
-        LogMsg("[dxgi_proxy] LoadLibrary real dxgi: %s (%p)\n", g_hRealDxgi ? "OK" : "FAIL", (void*)g_hRealDxgi);
+        LogMsg("[dxgi_proxy] LoadLibrary real dxgi: %s (%p)\n",
+               g_hRealDxgi ? "OK" : "FAIL", (void *)g_hRealDxgi);
 
-        wsprintfW(path, L"%s\\d3d12.dll", sysDir);
+        BuildSystemD3D12Path(path, MAX_PATH, sysDir);
         HMODULE hD3D12 = LoadLibraryW(path);
-        LogMsg("[dxgi_proxy] LoadLibrary real d3d12: %s (%p)\n", hD3D12 ? "OK" : "FAIL", (void*)hD3D12);
+        LogMsg("[dxgi_proxy] LoadLibrary real d3d12: %s (%p)\n",
+               hD3D12 ? "OK" : "FAIL", (void *)hD3D12);
 
-        // Step 2: Cache all real function pointers BEFORE rendertest.dll hooks IAT
+        // Step 2: Cache all real function pointers.
         if(g_hRealDxgi)
             CacheAllRealProcs();
 
-        // Step 3: Masquerade — rename the dxgi.dll file on disk AND in PEB.
-        // ACE may use NtQueryVirtualMemory(MemoryMappedFilenameInformation) which reads
-        // the kernel file object name. Renaming the file updates that name.
-        // We also modify the PEB module entry for good measure.
-        {
-            // Rename file on disk: dxgi.dll -> dxgi.dll.tmp
-            wchar_t dllDir[MAX_PATH];
-            GetModuleFileNameW(NULL, dllDir, MAX_PATH);
-            wchar_t *sl = wcsrchr(dllDir, L'\\');
-            if(sl) *(sl + 1) = L'\0';
-
-            wchar_t oldPath[MAX_PATH], newPath[MAX_PATH];
-            wcscpy_s(oldPath, dllDir);
-            wcscat_s(oldPath, L"dxgi.dll");
-            wcscpy_s(newPath, dllDir);
-            wcscat_s(newPath, L"dxgi.dll.tmp");
-
-            BOOL renamed = MoveFileW(oldPath, newPath);
-            LogMsg("[dxgi_proxy] Rename dxgi.dll -> dxgi.dll.tmp: %s (err=%lu)\n",
-                   renamed ? "OK" : "FAIL", renamed ? 0 : GetLastError());
-
-            // Also rename PEB entry
-            wchar_t fakeFullPath[MAX_PATH];
-            wsprintfW(fakeFullPath, L"%s\\mfplat.dll", sysDir);
-            MasqueradeModuleName(hModule, L"mfplat.dll", fakeFullPath);
-        }
-
-        // Step 4: Load rendertest.dll (only in game process)
-        if(IsGameProcess())
-        {
-            wchar_t dllDir[MAX_PATH];
-            GetModuleFileNameW(NULL, dllDir, MAX_PATH);
-            wchar_t *slash = wcsrchr(dllDir, L'\\');
-            if(slash)
-                *(slash + 1) = L'\0';
-            wchar_t rtPath[MAX_PATH];
-            wcscpy_s(rtPath, dllDir);
-            wcscat_s(rtPath, L"rendertest.dll");
-            HMODULE hRT = LoadLibraryW(rtPath);
-            LogMsg("[dxgi_proxy] LoadLibrary rendertest.dll: %s (%p)\n", hRT ? "OK" : "FAIL", (void*)hRT);
-        }
+        // Step 3: Rename the local proxy image on disk.
+        wchar_t newPath[MAX_PATH];
+        wcscpy_s(newPath, oldPath);
+        wchar_t *renameSlash = wcsrchr(newPath, L'\\');
+        if(renameSlash)
+            *(renameSlash + 1) = L'\0';
         else
-        {
-            LogMsg("[dxgi_proxy] Not game process, skipping rendertest.dll\n");
-        }
+            newPath[0] = L'\0';
+        wcscat_s(newPath, L"dxgi.dll.tmp");
+
+        BOOL renamed = MoveFileW(oldPath, newPath);
+        DWORD renameError = renamed ? ERROR_SUCCESS : GetLastError();
+        LogMsg("[dxgi_proxy] Rename dxgi.dll -> dxgi.dll.tmp: %s (err=%lu)\n",
+               renamed ? "OK" : "FAIL", renameError);
+
+        // Step 4: Rewrite the proxy's loader names using process-lifetime buffers.
+        wchar_t fakeFullPath[MAX_PATH];
+        wcscpy_s(fakeFullPath, sysDir);
+        wcscat_s(fakeFullPath, L"\\");
+        wcscat_s(fakeFullPath, L"winmm.dll");
+        MasqueradeModuleName(hModule, L"winmm.dll", fakeFullPath);
+
+        // Step 5: Load RenderDoc from the path captured before PEB rewriting.
+        HMODULE hRenderTest = LoadLibraryW(renderTestPath);
+        LogMsg("[dxgi_proxy] LoadLibrary rendertest.dll: %s (%p)\n",
+               hRenderTest ? "OK" : "FAIL", (void *)hRenderTest);
+        EnableRenderDocUnsupportedVendorExtensions(hRenderTest);
 
         LogMsg("[dxgi_proxy] Init complete\n");
     }
     else if(reason == DLL_PROCESS_DETACH)
     {
+        if(lpReserved == NULL)
+            RestoreModuleName(hModule);
+
         if(g_log)
         {
             LogMsg("[dxgi_proxy] DllMain DETACH (lpReserved=%p)\n", lpReserved);

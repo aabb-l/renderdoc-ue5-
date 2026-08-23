@@ -654,7 +654,14 @@
       <TreatWarningAsError>false</TreatWarningAsError>
       <WarningLevel>Level1</WarningLevel>
     </ClCompile>
-    <ClCompile Include="3rdparty\minhook\src\hde\hde64.c">
+    <ClCompile Include="3rdparty\minhook\src\hde\hde32.c" Condition="'$(Platform)'=='Win32'">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ForcedIncludeFiles />
+      <CompileAs>CompileAsC</CompileAs>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <WarningLevel>Level1</WarningLevel>
+    </ClCompile>
+    <ClCompile Include="3rdparty\minhook\src\hde\hde64.c" Condition="'$(Platform)'!='Win32'">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <ForcedIncludeFiles />
       <CompileAs>CompileAsC</CompileAs>

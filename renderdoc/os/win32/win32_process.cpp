@@ -249,7 +249,7 @@ extern "C" __declspec(dllexport) void __cdecl INTERNAL_ApplyEnvMods(void *ignore
   Process::ApplyEnvironmentModification();
 }
 
-void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
+void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid, bool processIsSuspended)
 {
   wchar_t dllPath[MAX_PATH + 1] = {0};
   wcscpy_s(dllPath, libName.c_str());
@@ -276,7 +276,6 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
   const SIZE_T pathSize = sizeof(dllPath);
   const SIZE_T shellcodeSize = 64;
   const SIZE_T totalSize = pathSize + shellcodeSize;
-  const SIZE_T shellcodeOffset = pathSize;
 
   void *remoteMem = VirtualAllocEx(hProcess, NULL, totalSize, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
   if(!remoteMem)
@@ -292,6 +291,12 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
     VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
     return;
   }
+
+  bool useRemoteThread = processIsSuspended;
+  bool releaseRemoteMemory = true;
+
+#if ENABLED(RDOC_X64)
+  const SIZE_T shellcodeOffset = pathSize;
 
   // build x64 shellcode:
   // sub rsp, 0x28              ; shadow space + align
@@ -329,7 +334,7 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
   DWORD mainTid = 0;
   ULONGLONG earliestCreate = ULLONG_MAX;
 
-  if(pid != 0)
+  if(pid != 0 && !processIsSuspended)
   {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if(hSnap != INVALID_HANDLE_VALUE)
@@ -385,6 +390,12 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
     ctx.ContextFlags = CONTEXT_FULL;
     if(GetThreadContext(hMainThread, &ctx))
     {
+      // Once the hijacked thread begins executing, LoadLibraryW and the return trampoline can both
+      // still reference this allocation while the thread's RIP is outside of it. We cannot prove a
+      // safe free point without synchronising from inside the shellcode, so retain the small block
+      // for the lifetime of the target process.
+      releaseRemoteMemory = false;
+
       uintptr_t origRip = ctx.Rip;
 
       // patch origRip into shellcode
@@ -422,11 +433,20 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
     {
       RDCERR("GetThreadContext failed: %u", GetLastError());
       ResumeThread(hMainThread);
+      useRemoteThread = true;
     }
 
     CloseHandle(hMainThread);
   }
   else
+  {
+    useRemoteThread = true;
+  }
+#else
+  useRemoteThread = true;
+#endif
+
+  if(useRemoteThread)
   {
     // fallback: CreateRemoteThread
     HANDLE hThread = CreateRemoteThread(
@@ -434,7 +454,18 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
         (LPTHREAD_START_ROUTINE)loadLibraryW, remoteMem, 0, NULL);
     if(hThread)
     {
-      WaitForSingleObject(hThread, INFINITE);
+      DWORD waitResult = WaitForSingleObject(hThread, INFINITE);
+      if(waitResult != WAIT_OBJECT_0)
+      {
+        if(waitResult == WAIT_FAILED)
+          RDCERR("Couldn't wait for remote LoadLibraryW thread: %u", GetLastError());
+        else
+          RDCERR("Unexpected wait result for remote LoadLibraryW thread: %u", waitResult);
+
+        // The remote thread may still reference remoteMem. Leaking this small allocation is safer
+        // than freeing executable data out from underneath it.
+        releaseRemoteMemory = false;
+      }
       CloseHandle(hThread);
     }
     else
@@ -443,7 +474,8 @@ void InjectDLL(HANDLE hProcess, rdcwstr libName, DWORD pid = 0)
     }
   }
 
-  VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+  if(releaseRemoteMemory)
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
 }
 
 uintptr_t FindRemoteDLL(DWORD pid, rdcstr libName)
@@ -724,7 +756,8 @@ static PROCESS_INFORMATION RunProcess(const rdcstr &app, const rdcstr &workingDi
 rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
                                                        const rdcarray<EnvironmentModification> &env,
                                                        const rdcstr &capturefile,
-                                                       const CaptureOptions &opts, bool waitForExit)
+                                                       const CaptureOptions &opts, bool waitForExit,
+                                                       bool processIsSuspended)
 {
   rdcwstr wcapturefile = StringFormat::UTF82Wide(capturefile);
 
@@ -990,8 +1023,10 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
     _snwprintf_s(
         paramsAlloc, 2047, 2047,
-        L"\"%ls\" capaltbit --pid=%u --capfile=\"%ls\" --debuglog=\"%ls\" --capopts=\"%hs\"",
-        renderdocPath, pid, wcapturefile.c_str(), wdebugLogfile.c_str(), optstr.c_str());
+        L"\"%ls\" capaltbit --pid=%u --capfile=\"%ls\" --debuglog=\"%ls\" --capopts=\"%hs\" "
+        L"--process-suspended=%u",
+        renderdocPath, pid, wcapturefile.c_str(), wdebugLogfile.c_str(), optstr.c_str(),
+        processIsSuspended ? 1U : 0U);
 
     RDCDEBUG("params %ls", paramsAlloc);
 
@@ -1120,7 +1155,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
     return {ResultCode::Succeeded, (uint32_t)exitCode};
   }
 
-  InjectDLL(hProcess, renderdocPath, pid);
+  InjectDLL(hProcess, renderdocPath, pid, processIsSuspended);
 
   const char *rdoc_dll = STRINGIZE(RDOC_BASE_NAME);
 
@@ -1313,10 +1348,10 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     return {result, 0};
   }
 
-  rdcpair<RDResult, uint32_t> ret = InjectIntoProcess(pi.dwProcessId, {}, capturefile, opts, false);
+  rdcpair<RDResult, uint32_t> ret =
+      InjectIntoProcess(pi.dwProcessId, {}, capturefile, opts, false, true);
 
   CloseHandle(pi.hProcess);
-  ResumeThread(pi.hThread);
   ResumeThread(pi.hThread);
 
   if(ret.second == 0 || ret.first != ResultCode::Succeeded)
