@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <winternl.h>
 #include <stdio.h>
+#include "../renderdoc/api/app/renderdoc_app.h"
 
 // ---- logging ----
 static FILE *g_log = NULL;
@@ -96,6 +97,24 @@ static void MasqueradeModuleName(HMODULE hModule, const wchar_t *newBaseName, co
     LogMsg("[dxgi_proxy] PEB masquerade: module %p not found in PEB!\n", (void*)hModule);
 }
 
+
+static void EnableNvidiaVendorExtension(HMODULE renderTestModule)
+{
+    if(!renderTestModule)
+        return;
+
+    pRENDERDOC_GetAPI getAPI = (pRENDERDOC_GetAPI)GetProcAddress(renderTestModule, "RENDERDOC_GetAPI");
+    if(!getAPI)
+        return;
+
+    RENDERDOC_API_1_6_0 *api = NULL;
+    if(getAPI(eRENDERDOC_API_Version_1_6_0, (void **)&api) != 1 || !api)
+        return;
+
+    // This option expects an IHV vendor id, not a boolean. 0x10DE enables NVIDIA/NvAPI passthrough.
+    api->SetCaptureOptionU32(eRENDERDOC_Option_AllowUnsupportedVendorExtensions, 0x10DE);
+}
+
 // ---- real dxgi.dll cached pointers ----
 static HMODULE g_hRealDxgi = NULL;
 
@@ -157,7 +176,9 @@ static bool IsGameProcess()
 {
     wchar_t exeName[MAX_PATH];
     GetModuleFileNameW(NULL, exeName, MAX_PATH);
-    return wcsstr(exeName, L"NRC-Win64-Shipping") != NULL;
+    return wcsstr(exeName, L"NRC-Win64-Shipping") != NULL ||
+           wcsstr(exeName, L"tlou-i.exe") != NULL ||
+           wcsstr(exeName, L"The Last of Us - Part I") != NULL;
 }
 
 // ---- DllMain ----
@@ -233,6 +254,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
             wcscpy_s(rtPath, dllDir);
             wcscat_s(rtPath, L"rendertest.dll");
             HMODULE hRT = LoadLibraryW(rtPath);
+            EnableNvidiaVendorExtension(hRT);
             LogMsg("[dxgi_proxy] LoadLibrary rendertest.dll: %s (%p)\n", hRT ? "OK" : "FAIL", (void*)hRT);
         }
         else

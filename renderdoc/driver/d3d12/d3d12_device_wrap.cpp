@@ -2411,10 +2411,10 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
       return E_INVALIDARG;
 
     if(dolog)
-      RDCLOG("Clamping shader model from 0x%x to 6.7", model->HighestShaderModel);
+      RDCLOG("Clamping shader model from 0x%x to 6.9", model->HighestShaderModel);
 
     // clamp SM to what we support
-    model->HighestShaderModel = RDCMIN(model->HighestShaderModel, D3D_SHADER_MODEL_6_7);
+    model->HighestShaderModel = RDCMIN(model->HighestShaderModel, D3D_SHADER_MODEL_6_9);
 
     return S_OK;
   }
