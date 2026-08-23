@@ -153,11 +153,25 @@ static void CacheAllRealProcs()
            (void*)g_real_CreateDXGIFactory, (void*)g_real_CreateDXGIFactory1, (void*)g_real_CreateDXGIFactory2);
 }
 
+static bool IsHelldivers2ProcessName(const wchar_t *exeName)
+{
+    return wcsstr(exeName, L"helldivers2.exe") != NULL ||
+           wcsstr(exeName, L"Helldivers 2") != NULL;
+}
+
 static bool IsGameProcess()
 {
     wchar_t exeName[MAX_PATH];
     GetModuleFileNameW(NULL, exeName, MAX_PATH);
-    return wcsstr(exeName, L"NRC-Win64-Shipping") != NULL;
+    return wcsstr(exeName, L"NRC-Win64-Shipping") != NULL ||
+           IsHelldivers2ProcessName(exeName);
+}
+
+static bool IsHelldivers2Process()
+{
+    wchar_t exeName[MAX_PATH];
+    GetModuleFileNameW(NULL, exeName, MAX_PATH);
+    return IsHelldivers2ProcessName(exeName);
 }
 
 // ---- DllMain ----
@@ -211,9 +225,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
             wcscpy_s(newPath, dllDir);
             wcscat_s(newPath, L"dxgi.dll.tmp");
 
-            BOOL renamed = MoveFileW(oldPath, newPath);
-            LogMsg("[dxgi_proxy] Rename dxgi.dll -> dxgi.dll.tmp: %s (err=%lu)\n",
-                   renamed ? "OK" : "FAIL", renamed ? 0 : GetLastError());
+            if(IsHelldivers2Process())
+            {
+                LogMsg("[dxgi_proxy] Rename dxgi.dll -> dxgi.dll.tmp: skipped for Helldivers 2 relaunch flow\n");
+            }
+            else
+            {
+                BOOL renamed = MoveFileW(oldPath, newPath);
+                LogMsg("[dxgi_proxy] Rename dxgi.dll -> dxgi.dll.tmp: %s (err=%lu)\n",
+                       renamed ? "OK" : "FAIL", renamed ? 0 : GetLastError());
+            }
 
             // Also rename PEB entry
             wchar_t fakeFullPath[MAX_PATH];

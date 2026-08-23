@@ -227,8 +227,16 @@ private:
     if(createFunc == NULL)
     {
       RDCWARN("Call to D3D11CreateDeviceAndSwapChain_hook without onward function pointer");
-      createFunc = (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN)GetProcAddress(
-          GetModuleHandleA("d3d11.dll"), "D3D11CreateDeviceAndSwapChain");
+
+      HMODULE d3d11Module = GetModuleHandleA("d3d11.dll");
+      if(d3d11Module == NULL)
+        d3d11Module = LoadLibraryA("d3d11.dll");
+
+      // Some games delay-load d3d11.dll and can call through the patched delay IAT before
+      // RenderDoc has cached the onward pointer. Retry after LoadLibraryA for the first call.
+      if(d3d11Module != NULL)
+        createFunc = (PFN_D3D11_CREATE_DEVICE_AND_SWAP_CHAIN)GetProcAddress(
+            d3d11Module, "D3D11CreateDeviceAndSwapChain");
     }
 
     // shouldn't ever get here, we should either have it from procaddress or the hook function, but
