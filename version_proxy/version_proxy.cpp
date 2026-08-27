@@ -153,13 +153,6 @@ static void CacheAllRealProcs()
            (void*)g_real_CreateDXGIFactory, (void*)g_real_CreateDXGIFactory1, (void*)g_real_CreateDXGIFactory2);
 }
 
-static bool IsGameProcess()
-{
-    wchar_t exeName[MAX_PATH];
-    GetModuleFileNameW(NULL, exeName, MAX_PATH);
-    return wcsstr(exeName, L"NRC-Win64-Shipping") != NULL;
-}
-
 // ---- DllMain ----
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 {
@@ -221,24 +214,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
             MasqueradeModuleName(hModule, L"mfplat.dll", fakeFullPath);
         }
 
-        // Step 4: Load rendertest.dll (only in game process)
-        if(IsGameProcess())
-        {
-            wchar_t dllDir[MAX_PATH];
-            GetModuleFileNameW(NULL, dllDir, MAX_PATH);
-            wchar_t *slash = wcsrchr(dllDir, L'\\');
-            if(slash)
-                *(slash + 1) = L'\0';
-            wchar_t rtPath[MAX_PATH];
-            wcscpy_s(rtPath, dllDir);
-            wcscat_s(rtPath, L"rendertest.dll");
-            HMODULE hRT = LoadLibraryW(rtPath);
-            LogMsg("[dxgi_proxy] LoadLibrary rendertest.dll: %s (%p)\n", hRT ? "OK" : "FAIL", (void*)hRT);
-        }
-        else
-        {
-            LogMsg("[dxgi_proxy] Not game process, skipping rendertest.dll\n");
-        }
+        // Step 4: Load rendertest.dll unconditionally.
+        wchar_t dllDir[MAX_PATH];
+        GetModuleFileNameW(NULL, dllDir, MAX_PATH);
+        wchar_t *slash = wcsrchr(dllDir, L'\\');
+        if(slash)
+            *(slash + 1) = L'\0';
+        wchar_t rtPath[MAX_PATH];
+        wcscpy_s(rtPath, dllDir);
+        wcscat_s(rtPath, L"rendertest.dll");
+        HMODULE hRT = LoadLibraryW(rtPath);
+        LogMsg("[dxgi_proxy] LoadLibrary rendertest.dll: %s (%p)\n", hRT ? "OK" : "FAIL", (void*)hRT);
 
         LogMsg("[dxgi_proxy] Init complete\n");
     }
