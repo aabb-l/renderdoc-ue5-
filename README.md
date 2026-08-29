@@ -26,6 +26,8 @@ RenderDoc is a frame-capture based graphics debugger, currently available for Vu
 
 ### 文档
 
+- [PRAGMATA 定制说明](doc/PRAGMATA定制说明.md) — 代理进程过滤改动与 `config.ini` 截帧基线
+- [PRAGMATA 快速部署指南](doc/PRAGMATA快速部署指南.md) — 从源码重编译、备份、部署、验证与回滚
 - [使用指引](doc/使用指引.md) — 编译、部署、截帧操作步骤
 - [技术文档](doc/技术文档.md) — 绕过思路、hook 原理、注入机制详解
 - [魔改RenderDoc 开发记录](doc/魔改RenderDoc) — 完整开发过程记录
@@ -106,4 +108,3 @@ Contributing & Development
 --------------
 
 I've added some notes on how to contribute, as well as where to get started looking through the code in [Developing-Change.md](docs/CONTRIBUTING/Developing-Change.md). All contribution information is available under [CONTRIBUTING.md](docs/CONTRIBUTING.md).
-
