@@ -73,7 +73,7 @@
   <PropertyGroup>
     <IntDir>$(SolutionDir)$(Platform)\$(Configuration)\obj\$(ProjectName)\</IntDir>
   </PropertyGroup>
-  <!-- Output: version.dll (the name the game expects) -->
+  <!-- Output: dxgi.dll (the proxy name loaded by the target process) -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Development|Win32'">
     <LinkIncremental>true</LinkIncremental>
     <OutDir>$(SolutionDir)$(Platform)\$(Configuration)\</OutDir>
@@ -172,6 +172,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="version_proxy.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="process_filter.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="version_proxy.def" />

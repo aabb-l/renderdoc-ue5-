@@ -2,9 +2,10 @@
 //
 // Strategy:
 // 1. Game calls LoadLibrary("dxgi.dll") → loads this proxy from game directory
-// 2. DllMain pre-loads System32 dxgi/d3d12/d3d11, caches real function pointers,
-//    loads rendertest.dll (RenderDoc hooks installed)
-// 3. Renames own module entry in the PEB from "dxgi.dll" to "mfplat.dll"
+// 2. DllMain always loads System32 dxgi.dll and caches its real function pointers
+// 3. For non-RenderDoc tool processes, DllMain pre-loads System32 d3d12.dll,
+//    loads rendertest.dll (RenderDoc hooks installed), and renames its own module
+//    entry in the PEB from "dxgi.dll" to "mfplat.dll"
 //    so ACE's module name scan does not find "dxgi.dll" in the loaded modules list
 // 4. Proxy exports forward to System32 dxgi.dll (already inline-hooked by RenderDoc)
 
@@ -12,6 +13,8 @@
 #include <windows.h>
 #include <winternl.h>
 #include <stdio.h>
+
+#include "process_filter.h"
 
 // ---- logging ----
 static FILE *g_log = NULL;
@@ -153,13 +156,6 @@ static void CacheAllRealProcs()
            (void*)g_real_CreateDXGIFactory, (void*)g_real_CreateDXGIFactory1, (void*)g_real_CreateDXGIFactory2);
 }
 
-static bool IsGameProcess()
-{
-    wchar_t exeName[MAX_PATH];
-    GetModuleFileNameW(NULL, exeName, MAX_PATH);
-    return wcsstr(exeName, L"NRC-Win64-Shipping") != NULL;
-}
-
 // ---- DllMain ----
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 {
@@ -177,7 +173,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 
         LogMsg("\n[dxgi_proxy] === DllMain ATTACH (module=%p) ===\n", (void*)hModule);
 
-        // Step 1: Load real System32 DLLs
+        wchar_t processPath[MAX_PATH] = {};
+        GetModuleFileNameW(NULL, processPath, MAX_PATH);
+        const bool enableProxyInjection = ShouldEnableProxyInjectionForProcessPath(processPath);
+
+        // Step 1: Always load real System32 DXGI so exports can be forwarded.
         wchar_t sysDir[MAX_PATH];
         GetSystemDirectoryW(sysDir, MAX_PATH);
         wchar_t path[MAX_PATH];
@@ -186,44 +186,45 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         g_hRealDxgi = LoadLibraryW(path);
         LogMsg("[dxgi_proxy] LoadLibrary real dxgi: %s (%p)\n", g_hRealDxgi ? "OK" : "FAIL", (void*)g_hRealDxgi);
 
-        wsprintfW(path, L"%s\\d3d12.dll", sysDir);
-        HMODULE hD3D12 = LoadLibraryW(path);
-        LogMsg("[dxgi_proxy] LoadLibrary real d3d12: %s (%p)\n", hD3D12 ? "OK" : "FAIL", (void*)hD3D12);
-
-        // Step 2: Cache all real function pointers BEFORE rendertest.dll hooks IAT
+        // Step 2: Cache all real function pointers before any RenderDoc hooks are installed.
         if(g_hRealDxgi)
             CacheAllRealProcs();
 
-        // Step 3: Masquerade — rename the dxgi.dll file on disk AND in PEB.
-        // ACE may use NtQueryVirtualMemory(MemoryMappedFilenameInformation) which reads
-        // the kernel file object name. Renaming the file updates that name.
-        // We also modify the PEB module entry for good measure.
+        if(enableProxyInjection)
         {
-            // Rename file on disk: dxgi.dll -> dxgi.dll.tmp
-            wchar_t dllDir[MAX_PATH];
-            GetModuleFileNameW(NULL, dllDir, MAX_PATH);
-            wchar_t *sl = wcsrchr(dllDir, L'\\');
-            if(sl) *(sl + 1) = L'\0';
+            // Step 3: Preload D3D12 only for the target application. RenderDoc replay tools
+            // must select the D3D12Core version embedded in the capture themselves.
+            wsprintfW(path, L"%s\\d3d12.dll", sysDir);
+            HMODULE hD3D12 = LoadLibraryW(path);
+            LogMsg("[dxgi_proxy] LoadLibrary real d3d12: %s (%p)\n", hD3D12 ? "OK" : "FAIL", (void*)hD3D12);
 
-            wchar_t oldPath[MAX_PATH], newPath[MAX_PATH];
-            wcscpy_s(oldPath, dllDir);
-            wcscat_s(oldPath, L"dxgi.dll");
-            wcscpy_s(newPath, dllDir);
-            wcscat_s(newPath, L"dxgi.dll.tmp");
+            // Step 4: Masquerade — rename the dxgi.dll file on disk and in the PEB.
+            // ACE may use NtQueryVirtualMemory(MemoryMappedFilenameInformation) which reads
+            // the kernel file object name. Renaming the file updates that name.
+            {
+                // Rename file on disk: dxgi.dll -> dxgi.dll.tmp
+                wchar_t dllDir[MAX_PATH];
+                GetModuleFileNameW(NULL, dllDir, MAX_PATH);
+                wchar_t *sl = wcsrchr(dllDir, L'\\');
+                if(sl) *(sl + 1) = L'\0';
 
-            BOOL renamed = MoveFileW(oldPath, newPath);
-            LogMsg("[dxgi_proxy] Rename dxgi.dll -> dxgi.dll.tmp: %s (err=%lu)\n",
-                   renamed ? "OK" : "FAIL", renamed ? 0 : GetLastError());
+                wchar_t oldPath[MAX_PATH], newPath[MAX_PATH];
+                wcscpy_s(oldPath, dllDir);
+                wcscat_s(oldPath, L"dxgi.dll");
+                wcscpy_s(newPath, dllDir);
+                wcscat_s(newPath, L"dxgi.dll.tmp");
 
-            // Also rename PEB entry
-            wchar_t fakeFullPath[MAX_PATH];
-            wsprintfW(fakeFullPath, L"%s\\mfplat.dll", sysDir);
-            MasqueradeModuleName(hModule, L"mfplat.dll", fakeFullPath);
-        }
+                BOOL renamed = MoveFileW(oldPath, newPath);
+                LogMsg("[dxgi_proxy] Rename dxgi.dll -> dxgi.dll.tmp: %s (err=%lu)\n",
+                       renamed ? "OK" : "FAIL", renamed ? 0 : GetLastError());
 
-        // Step 4: Load rendertest.dll (only in game process)
-        if(IsGameProcess())
-        {
+                // Also rename PEB entry
+                wchar_t fakeFullPath[MAX_PATH];
+                wsprintfW(fakeFullPath, L"%s\\mfplat.dll", sysDir);
+                MasqueradeModuleName(hModule, L"mfplat.dll", fakeFullPath);
+            }
+
+            // Step 5: Load rendertest.dll for all non-RenderDoc host processes.
             wchar_t dllDir[MAX_PATH];
             GetModuleFileNameW(NULL, dllDir, MAX_PATH);
             wchar_t *slash = wcsrchr(dllDir, L'\\');
@@ -237,7 +238,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         }
         else
         {
-            LogMsg("[dxgi_proxy] Not game process, skipping rendertest.dll\n");
+            LogMsg("[dxgi_proxy] RenderDoc tool process, skipping d3d12 preload, masquerade, and rendertest.dll\n");
         }
 
         LogMsg("[dxgi_proxy] Init complete\n");
