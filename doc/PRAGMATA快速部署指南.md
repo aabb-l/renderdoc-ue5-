@@ -8,30 +8,93 @@
 - 仓库构建输出中的 `rendertest.dll`：RenderDoc 捕获核心。
 - 仓库构建输出中的 `qrendertest.exe`：捕获和回放界面。
 - 游戏目录中更新后的 `dxgi.dll` 与 `rendertest.dll`。
-- `E:\PRAGMATA\config.ini` 中经过验证的 `[Render]` 配置。
+- 游戏目录下 `config.ini` 中经过验证的 `[Render]` 配置。
 
 游戏目录只部署两个 DLL。不要把 `qrendertest.exe`、PDB、LIB、日志或整个 `x64\Release` 目录复制到游戏目录。
 
 ## 2. 路径和变量
 
-本文使用以下实际路径：
+本文不记录任何机器的真实目录。先在同一个 PowerShell 会话中定义以下变量，后续命令均复用它们：
 
-| 名称 | 当前值 | 含义 |
-|---|---|---|
-| `REPO_ROOT` | `E:\Project\RenderDoc\doc-nrc\renderdoc-ue5-github-validated` | 源码仓库 |
-| `BUILD_ROOT` | `E:\Project\RenderDoc\doc-nrc\renderdoc-ue5-github-validated\x64\Release` | Release x64 构建输出 |
-| `GAME_ROOT` | `E:\PRAGMATA` | `PRAGMATA.exe` 与 `config.ini` 所在目录 |
-| `MSBUILD` | `C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe` | VS2022 MSBuild |
+~~~powershell
+$repoRoot = '<REPO_ROOT>'
+$gameRoot = '<GAME_ROOT>'
+$backupBase = '<BACKUP_BASE>'
 
-若机器或版本不同，先替换这些路径，再执行后续步骤。不要猜测游戏目录：代理 DLL 必须与实际启动的 `PRAGMATA.exe` 位于同一目录。
+$vswherePath = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (-not (Test-Path -LiteralPath $vswherePath -PathType Leaf)) {
+  throw "找不到 vswhere.exe：$vswherePath"
+}
+
+$msbuildPath = & $vswherePath -latest -products * -version '[17.0,18.0)' `
+  -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+  -find 'MSBuild\**\Bin\MSBuild.exe' | Select-Object -First 1
+if (-not $msbuildPath -or -not (Test-Path -LiteralPath $msbuildPath -PathType Leaf)) {
+  throw '找不到同时包含 MSBuild 和 x64 C++ 工具的 Visual Studio 2022'
+}
+
+foreach ($value in @($repoRoot, $gameRoot, $backupBase)) {
+  if ([string]::IsNullOrWhiteSpace($value) -or $value -match '^<.+>$') {
+    throw '必须先把 REPO_ROOT、GAME_ROOT 和 BACKUP_BASE 占位符替换为实际目录'
+  }
+}
+
+function ConvertTo-AbsoluteDirectoryPath {
+  param([Parameter(Mandatory)][string]$Path)
+
+  $fullPath = [System.IO.Path]::GetFullPath($Path)
+  $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+  if ($fullPath.Length -gt $pathRoot.Length) {
+    return $fullPath.TrimEnd('\', '/')
+  }
+  return $fullPath
+}
+
+$repoRoot = ConvertTo-AbsoluteDirectoryPath $repoRoot
+$gameRoot = ConvertTo-AbsoluteDirectoryPath $gameRoot
+$backupBase = ConvertTo-AbsoluteDirectoryPath $backupBase
+$buildRoot = Join-Path $repoRoot 'x64\Release'
+
+if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'renderdoc.sln') -PathType Leaf)) {
+  throw "仓库目录无效，缺少 renderdoc.sln：$repoRoot"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $gameRoot 'PRAGMATA.exe') -PathType Leaf)) {
+  throw "游戏目录无效，缺少 PRAGMATA.exe：$gameRoot"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $gameRoot 'config.ini') -PathType Leaf)) {
+  throw "游戏目录无效，缺少 config.ini：$gameRoot"
+}
+
+$pathComparison = [System.StringComparison]::OrdinalIgnoreCase
+$gameRootPrefix = if ($gameRoot.EndsWith('\') -or $gameRoot.EndsWith('/')) {
+  $gameRoot
+} else {
+  "$gameRoot\"
+}
+if ($backupBase.Equals($gameRoot, $pathComparison) -or
+    $backupBase.StartsWith($gameRootPrefix, $pathComparison)) {
+  throw 'BACKUP_BASE 必须位于游戏目录之外'
+}
+~~~
+
+占位符含义：
+
+| 占位符 | 含义 |
+|---|---|
+| `<REPO_ROOT>` | 本仓库根目录，即包含 `renderdoc.sln` 的目录 |
+| `<GAME_ROOT>` | `PRAGMATA.exe` 与 `config.ini` 所在目录 |
+| `<BACKUP_BASE>` | 游戏目录之外、用于保存部署备份的目录 |
+| `<PREDEPLOY_BACKUP_ROOT>` | 某次完整部署备份的确切目录，即第 7 节备份命令输出的路径 |
+
+执行前必须替换三个占位符。初始化脚本会立即把它们规范化为绝对路径，再派生 `$buildRoot`；后续切换当前目录不会改变路径含义。脚本还会验证仓库、游戏和备份目录，避免对错误目录执行构建或部署。代理 DLL 必须与实际启动的 `PRAGMATA.exe` 位于同一目录。MSBuild 由 Visual Studio Installer 自带的 `vswhere.exe` 自动查找，不依赖固定安装目录。
 
 ## 3. 前置条件
 
 - Windows x64。
-- Visual Studio 2022 Community，安装“使用 C++ 的桌面开发”工作负载和 v143 工具集。
+- Visual Studio 2022（任意版本类别），安装 MSBuild、“使用 C++ 的桌面开发”工作负载和 v143 x64 工具集。
 - 仓库及其依赖完整可用。
 - 使用 `pragmata` 分支进行 PRAGMATA 部署。
-- 能正常读取和写入 `E:\PRAGMATA`。
+- 能正常读取和写入 `$gameRoot` 指向的游戏目录。
 - 部署前由人手动退出 PRAGMATA、启动器中的游戏进程以及 `qrendertest.exe`。
 
 不要用脚本强制结束游戏或 RenderDoc 工具。若文件仍被占用，停止部署并让使用者确认相关程序已经正常退出。
@@ -39,7 +102,7 @@
 全新克隆的仓库还需要初始化当前唯一的子模块 `renderdoc/3rdparty/minhook`：
 
 ~~~powershell
-git submodule update --init --recursive
+git -C $repoRoot submodule update --init --recursive
 if ($LASTEXITCODE -ne 0) { throw "子模块初始化失败，退出码：$LASTEXITCODE" }
 ~~~
 
@@ -65,26 +128,33 @@ AI 或自动化工具执行本文时必须遵守：
 在 PowerShell 中执行：
 
 ~~~powershell
-Set-Location -LiteralPath 'E:\Project\RenderDoc\doc-nrc\renderdoc-ue5-github-validated'
-git branch --show-current
-git status --short
+$currentBranch = (git -C $repoRoot branch --show-current).Trim()
+if ($LASTEXITCODE -ne 0) { throw '无法读取当前分支' }
+if ($currentBranch -ne 'pragmata') { throw "当前分支不是 pragmata：$currentBranch" }
+
+$gitStatus = @(git -C $repoRoot status --porcelain)
+if ($LASTEXITCODE -ne 0) { throw '无法读取工作区状态' }
+if ($gitStatus.Count -ne 0) {
+  $gitStatus | Write-Output
+  throw '构建前工作区必须完全干净，包括子模块状态和未跟踪文件'
+}
 ~~~
 
 期望：
 
 - 当前分支为 `pragmata`。
-- 工作区没有无法解释的源码改动。
+- 工作区完全干净；提交号只有在不混入未提交源码、子模块改动或未跟踪文件时，才能准确标识本次构建状态。
 
 如果需要切换分支，先确认现有修改已经妥善保存，再执行：
 
 ~~~powershell
-git switch pragmata
+git -C $repoRoot switch pragmata
 ~~~
 
 若要同步远端，使用快进更新：
 
 ~~~powershell
-git pull --ff-only origin pragmata
+git -C $repoRoot pull --ff-only origin pragmata
 ~~~
 
 拉取失败或提示分叉时停止，不要自动 rebase、强制推送或重置分支。
@@ -94,8 +164,10 @@ git pull --ff-only origin pragmata
 ### 6.1 执行 Release x64 Rebuild
 
 ~~~powershell
-$repoRoot = 'E:\Project\RenderDoc\doc-nrc\renderdoc-ue5-github-validated'
-$msbuildPath = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
+$gitStatus = @(git -C $repoRoot status --porcelain)
+if ($LASTEXITCODE -ne 0 -or $gitStatus.Count -ne 0) {
+  throw 'Rebuild 前工作区不是干净状态'
+}
 
 Set-Location -LiteralPath $repoRoot
 & $msbuildPath '.\renderdoc.sln' '/t:Rebuild' '/m' '/p:Configuration=Release' '/p:Platform=x64' '/v:minimal' '/nologo'
@@ -107,7 +179,6 @@ if ($LASTEXITCODE -ne 0) { throw "Release x64 Rebuild 失败，退出码：$LAST
 ### 6.2 核对必要产物
 
 ~~~powershell
-$buildRoot = 'E:\Project\RenderDoc\doc-nrc\renderdoc-ue5-github-validated\x64\Release'
 $requiredOutputs = @('dxgi.dll', 'rendertest.dll', 'qrendertest.exe')
 
 foreach ($name in $requiredOutputs) {
@@ -123,8 +194,8 @@ foreach ($name in $requiredOutputs) {
 
 | 文件 | 使用位置 |
 |---|---|
-| `dxgi.dll` | 复制到 `E:\PRAGMATA` |
-| `rendertest.dll` | 复制到 `E:\PRAGMATA` |
+| `dxgi.dll` | 复制到 `$gameRoot` |
+| `rendertest.dll` | 复制到 `$gameRoot` |
 | `qrendertest.exe` | 直接从 `x64\Release` 运行，不复制到游戏目录 |
 
 ## 7. 备份现有部署和配置
@@ -137,12 +208,15 @@ foreach ($name in $requiredOutputs) {
 4. 将遗留的 `dxgi.dll.tmp` 移出游戏目录，避免下次代理重命名冲突。
 
 ~~~powershell
-$repoRoot = 'E:\Project\RenderDoc\doc-nrc\renderdoc-ue5-github-validated'
-$gameRoot = 'E:\PRAGMATA'
-$backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupBase = 'E:\PRAGMATA-backups'
+$backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $backupRoot = Join-Path $backupBase "predeploy-$backupStamp"
-New-Item -ItemType Directory -Path $backupRoot -Force -ErrorAction Stop | Out-Null
+if (Test-Path -LiteralPath $backupBase -PathType Leaf) {
+  throw "备份基准路径是文件而不是目录：$backupBase"
+}
+if (-not (Test-Path -LiteralPath $backupBase -PathType Container)) {
+  New-Item -ItemType Directory -Path $backupBase -ErrorAction Stop | Out-Null
+}
+New-Item -ItemType Directory -Path $backupRoot -ErrorAction Stop | Out-Null
 
 $sourceCommit = git -C $repoRoot rev-parse HEAD
 if ($LASTEXITCODE -ne 0 -or -not $sourceCommit) {
@@ -160,39 +234,46 @@ $fileStates = foreach ($name in $trackedNames) {
 }
 
 $deploymentState = [ordered]@{
+  deploymentId = [guid]::NewGuid().ToString('D')
   createdAt = (Get-Date).ToString('o')
   sourceCommit = $sourceCommit
+  gameRoot = $gameRoot
+  backupRoot = $backupRoot
   files = @($fileStates)
 }
 
-foreach ($name in @('config.ini', 'dxgi.dll', 'rendertest.dll')) {
+foreach ($name in $trackedNames) {
   $sourcePath = Join-Path $gameRoot $name
   if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
-    Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $backupRoot $name) -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $backupRoot $name) -ErrorAction Stop
   }
 }
 
-$oldProxyTemp = Join-Path $gameRoot 'dxgi.dll.tmp'
-if (Test-Path -LiteralPath $oldProxyTemp -PathType Leaf) {
-  Move-Item -LiteralPath $oldProxyTemp -Destination (Join-Path $backupRoot 'dxgi.dll.tmp') -Force -ErrorAction Stop
-}
-
 Set-Content -LiteralPath (Join-Path $backupRoot 'source-commit.txt') -Value $sourceCommit -Encoding ascii -ErrorAction Stop
+$stateTempPath = Join-Path $backupRoot 'deployment-state.json.tmp'
+$statePath = Join-Path $backupRoot 'deployment-state.json'
 $deploymentState | ConvertTo-Json -Depth 4 |
-  Set-Content -LiteralPath (Join-Path $backupRoot 'deployment-state.json') -Encoding utf8 -ErrorAction Stop
+  Set-Content -LiteralPath $stateTempPath -Encoding utf8 -ErrorAction Stop
+Move-Item -LiteralPath $stateTempPath -Destination $statePath -ErrorAction Stop
 
 "源码提交：$sourceCommit"
 "备份目录：$backupRoot"
+
+$oldProxyTemp = Join-Path $gameRoot 'dxgi.dll.tmp'
+if (Test-Path -LiteralPath $oldProxyTemp -PathType Leaf) {
+  Move-Item -LiteralPath $oldProxyTemp `
+    -Destination (Join-Path $backupRoot 'removed-dxgi.dll.tmp') -ErrorAction Stop
+}
 ~~~
 
-备份目录放在游戏目录之外，避免备份 DLL 与游戏运行目录混在一起。保存输出的源码提交号和备份目录；第 13 节回滚会依赖 `deployment-state.json`。如果复制或移动失败，文件可能仍被占用，此时停止，不要强制结束进程或继续覆盖 DLL。
+备份目录放在游戏目录之外，避免备份 DLL 与游戏运行目录混在一起。脚本先复制四个受管文件并原子写入部署状态，再移动游戏目录中的遗留 `dxgi.dll.tmp`；因此元数据落盘失败时不会先改变游戏目录。保存输出的源码提交号和备份目录；第 13 节回滚会依赖 `deployment-state.json`。如果复制或移动失败，文件可能仍被占用，此时停止，不要强制结束进程或继续覆盖 DLL。若最后移动 `dxgi.dll.tmp` 失败，备份和状态文件仍然有效，但不得继续部署。
 
 ## 8. 定制 `config.ini`
 
 打开：
 
 ~~~text
-E:\PRAGMATA\config.ini
+<GAME_ROOT>\config.ini
 ~~~
 
 仅将 `[Render]` 段替换为：
@@ -204,7 +285,7 @@ Capability=DirectX12
 ForceMeshShader=Disable
 ParallelBuildCommandList=Disable
 ParallelBuildProcessorCount=0
-RenderWorkerThreadPriorityAboveNormal=Enable
+RenderWorkerThreadPriorityAboveNormal=Disable
 TightFitShaderCache=Disable
 UseComputeQueuePairing=Disable
 UsingIndepentRenderWorker=Disable
@@ -217,24 +298,42 @@ UsingIndepentRenderWorker=Disable
 - 不同时保留两个 `[Render]` 段。
 - 修改后重新读取该段，逐行确认 9 个键和值。
 - 配置变化只影响之后新启动的游戏和新生成的捕获，不会修复已有 `.rdc`。
+- 截帧前建议使用游戏内帧率上限或显卡驱动设置，将帧率限制为稳定的 30 FPS。较低且稳定的帧率通常能减少捕获期间的命令量、资源变化和瞬时调度压力。该设置是稳定性建议，不是代理工作的硬性条件；修改帧率限制后，应重启游戏再生成新捕获。
 
 ## 9. 部署 DLL
 
 再次确认游戏和工具已退出，然后执行：
 
 ~~~powershell
-$buildRoot = 'E:\Project\RenderDoc\doc-nrc\renderdoc-ue5-github-validated\x64\Release'
-$gameRoot = 'E:\PRAGMATA'
-
-Copy-Item -LiteralPath (Join-Path $buildRoot 'dxgi.dll') -Destination (Join-Path $gameRoot 'dxgi.dll') -Force -ErrorAction Stop
-Copy-Item -LiteralPath (Join-Path $buildRoot 'rendertest.dll') -Destination (Join-Path $gameRoot 'rendertest.dll') -Force -ErrorAction Stop
+try {
+  Copy-Item -LiteralPath (Join-Path $buildRoot 'dxgi.dll') `
+    -Destination (Join-Path $gameRoot 'dxgi.dll') -Force -ErrorAction Stop
+  Copy-Item -LiteralPath (Join-Path $buildRoot 'rendertest.dll') `
+    -Destination (Join-Path $gameRoot 'rendertest.dll') -Force -ErrorAction Stop
+} catch {
+  Write-Error 'DLL 部署未完整完成。不要启动游戏；请使用第 7 节生成的备份按第 13 节回滚。'
+  throw
+}
 ~~~
 
-部署后只做文件存在性、大小和时间检查：
+部署后只做源文件与目标文件的存在性、大小和时间检查：
 
 ~~~powershell
-Get-Item -LiteralPath 'E:\PRAGMATA\dxgi.dll', 'E:\PRAGMATA\rendertest.dll' |
-  Select-Object FullName, Length, LastWriteTime
+$deployNames = @('dxgi.dll', 'rendertest.dll')
+foreach ($name in $deployNames) {
+  $sourceItem = Get-Item -LiteralPath (Join-Path $buildRoot $name) -ErrorAction Stop
+  $targetItem = Get-Item -LiteralPath (Join-Path $gameRoot $name) -ErrorAction Stop
+  if ($sourceItem.Length -ne $targetItem.Length) {
+    throw "部署文件大小与构建产物不一致：$name"
+  }
+  [pscustomobject]@{
+    Name = $name
+    SourceLength = $sourceItem.Length
+    TargetLength = $targetItem.Length
+    SourceTime = $sourceItem.LastWriteTime
+    TargetTime = $targetItem.LastWriteTime
+  }
+}
 ~~~
 
 不要从其他仓库或旧发布目录混用 DLL 与 EXE；`dxgi.dll`、`rendertest.dll` 和 `qrendertest.exe` 应来自同一次源码状态和同一次 Release x64 重编译。
@@ -251,7 +350,6 @@ Get-Item -LiteralPath 'E:\PRAGMATA\dxgi.dll', 'E:\PRAGMATA\rendertest.dll' |
 只有 `dxgi.dll.tmp` 时可执行：
 
 ~~~powershell
-$gameRoot = 'E:\PRAGMATA'
 $proxyPath = Join-Path $gameRoot 'dxgi.dll'
 $proxyTempPath = Join-Path $gameRoot 'dxgi.dll.tmp'
 
@@ -267,12 +365,12 @@ if ((Test-Path -LiteralPath $proxyTempPath -PathType Leaf) -and
 2. 从当前构建输出运行：
 
    ~~~powershell
-   & 'E:\Project\RenderDoc\doc-nrc\renderdoc-ue5-github-validated\x64\Release\qrendertest.exe'
+   & (Join-Path $buildRoot 'qrendertest.exe')
    ~~~
 
 3. 在 Attach/进程列表中选择实际的 PRAGMATA 游戏进程。
 4. 确认捕获 API 为 D3D12。
-5. 进入可稳定复现的场景并触发捕获。
+5. 建议先将游戏帧率限制为稳定的 30 FPS，重启游戏后进入可稳定复现的场景并触发捕获。
 6. 在同一个 `qrendertest.exe` 中打开新生成的 `.rdc`。
 7. 检查主要场景、角色、特效、阴影和后处理是否存在，切换多个事件确认绘制不是只在单帧视图中被隐藏。
 
@@ -289,6 +387,7 @@ if ((Test-Path -LiteralPath $proxyTempPath -PathType Leaf) -and
 - [ ] `config.ini` 的 `[Render]` 段与本文完全一致。
 - [ ] PRAGMATA 可以正常启动。
 - [ ] 工具可以识别 D3D12 进程并触发捕获。
+- [ ] 截帧场景已建议限制为稳定的 30 FPS。
 - [ ] 新生成的捕获可以打开。
 - [ ] 主要绘制、资源和后处理没有明显缺失。
 
@@ -333,7 +432,7 @@ if ((Test-Path -LiteralPath $proxyTempPath -PathType Leaf) -and
 先手动退出游戏和工具。假设备份目录为：
 
 ~~~text
-E:\PRAGMATA-backups\predeploy-YYYYMMDD-HHMMSS
+<BACKUP_BASE>\predeploy-YYYYMMDD-HHMMSS-fff
 ~~~
 
 恢复步骤：
@@ -347,11 +446,44 @@ E:\PRAGMATA-backups\predeploy-YYYYMMDD-HHMMSS
 示例脚本会保留备份目录，并把回滚前的当前文件放在其子目录中，因此仍可人工恢复：
 
 ~~~powershell
-$gameRoot = 'E:\PRAGMATA'
-$backupRoot = 'E:\PRAGMATA-backups\predeploy-YYYYMMDD-HHMMSS'
-$statePath = Join-Path $backupRoot 'deployment-state.json'
+$gameRoot = '<GAME_ROOT>'
+$backupRoot = '<PREDEPLOY_BACKUP_ROOT>'
 $expectedNames = @('config.ini', 'dxgi.dll', 'dxgi.dll.tmp', 'rendertest.dll')
 
+foreach ($value in @($gameRoot, $backupRoot)) {
+  if ([string]::IsNullOrWhiteSpace($value) -or $value -match '^<.+>$') {
+    throw '必须先替换 GAME_ROOT 和 PREDEPLOY_BACKUP_ROOT 占位符'
+  }
+}
+
+function ConvertTo-AbsoluteDirectoryPath {
+  param([Parameter(Mandatory)][string]$Path)
+
+  $fullPath = [System.IO.Path]::GetFullPath($Path)
+  $pathRoot = [System.IO.Path]::GetPathRoot($fullPath)
+  if ($fullPath.Length -gt $pathRoot.Length) {
+    return $fullPath.TrimEnd('\', '/')
+  }
+  return $fullPath
+}
+
+$gameRoot = ConvertTo-AbsoluteDirectoryPath $gameRoot
+$backupRoot = ConvertTo-AbsoluteDirectoryPath $backupRoot
+$statePath = Join-Path $backupRoot 'deployment-state.json'
+$pathComparison = [System.StringComparison]::OrdinalIgnoreCase
+$gameRootPrefix = if ($gameRoot.EndsWith('\') -or $gameRoot.EndsWith('/')) {
+  $gameRoot
+} else {
+  "$gameRoot\"
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $gameRoot 'PRAGMATA.exe') -PathType Leaf)) {
+  throw "游戏目录无效，缺少 PRAGMATA.exe：$gameRoot"
+}
+if ($backupRoot.Equals($gameRoot, $pathComparison) -or
+    $backupRoot.StartsWith($gameRootPrefix, $pathComparison)) {
+  throw 'PREDEPLOY_BACKUP_ROOT 必须位于游戏目录之外'
+}
 if (-not (Test-Path -LiteralPath $backupRoot -PathType Container)) {
   throw "备份目录不存在：$backupRoot"
 }
@@ -360,14 +492,44 @@ if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
 }
 
 $deploymentState = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json
-$recordedNames = @($deploymentState.files | ForEach-Object { $_.name })
+if ([string]::IsNullOrWhiteSpace([string]$deploymentState.deploymentId)) {
+  throw '部署状态缺少 deploymentId'
+}
+$parsedDeploymentId = [guid]::Empty
+if (-not [guid]::TryParse([string]$deploymentState.deploymentId, [ref]$parsedDeploymentId)) {
+  throw '部署状态中的 deploymentId 不是有效 GUID'
+}
+if ([string]::IsNullOrWhiteSpace([string]$deploymentState.gameRoot) -or
+    -not $gameRoot.Equals([string]$deploymentState.gameRoot, $pathComparison)) {
+  throw "部署状态中的 gameRoot 与当前游戏目录不一致：$($deploymentState.gameRoot)"
+}
+if ([string]::IsNullOrWhiteSpace([string]$deploymentState.backupRoot) -or
+    -not $backupRoot.Equals([string]$deploymentState.backupRoot, $pathComparison)) {
+  throw "部署状态中的 backupRoot 与当前备份目录不一致：$($deploymentState.backupRoot)"
+}
+
+$fileStates = @($deploymentState.files)
+if ($fileStates.Count -ne $expectedNames.Count) {
+  throw "部署状态文件记录数错误：应为 $($expectedNames.Count)，实际为 $($fileStates.Count)"
+}
+
+$recordedNames = @($fileStates | ForEach-Object { $_.name })
+if (@($recordedNames | Select-Object -Unique).Count -ne $recordedNames.Count) {
+  throw '部署状态文件包含重复的文件名'
+}
 foreach ($name in $expectedNames) {
   if ($recordedNames -notcontains $name) {
     throw "部署状态缺少文件记录：$name"
   }
 }
 
-foreach ($fileState in $deploymentState.files) {
+foreach ($fileState in $fileStates) {
+  if ($expectedNames -notcontains $fileState.name) {
+    throw "部署状态包含非预期文件：$($fileState.name)"
+  }
+  if ($null -eq $fileState.existed -or $fileState.existed -isnot [bool]) {
+    throw "部署状态的 existed 不是布尔值：$($fileState.name)"
+  }
   if ($fileState.existed) {
     $backupPath = Join-Path $backupRoot $fileState.name
     if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
@@ -376,28 +538,28 @@ foreach ($fileState in $deploymentState.files) {
   }
 }
 
-$rollbackStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$rollbackStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $rollbackRoot = Join-Path $backupRoot "rollback-current-$rollbackStamp"
-New-Item -ItemType Directory -Path $rollbackRoot -Force -ErrorAction Stop | Out-Null
+New-Item -ItemType Directory -Path $rollbackRoot -ErrorAction Stop | Out-Null
 
 foreach ($name in $expectedNames) {
   $currentPath = Join-Path $gameRoot $name
   if (Test-Path -LiteralPath $currentPath -PathType Leaf) {
-    Move-Item -LiteralPath $currentPath -Destination (Join-Path $rollbackRoot $name) -Force -ErrorAction Stop
+    Move-Item -LiteralPath $currentPath -Destination (Join-Path $rollbackRoot $name) -ErrorAction Stop
   }
 }
 
-foreach ($fileState in $deploymentState.files) {
+foreach ($fileState in $fileStates) {
   if ($fileState.existed) {
     Copy-Item -LiteralPath (Join-Path $backupRoot $fileState.name) `
-      -Destination (Join-Path $gameRoot $fileState.name) -Force -ErrorAction Stop
+      -Destination (Join-Path $gameRoot $fileState.name) -ErrorAction Stop
   }
 }
 
 "回滚前文件暂存目录：$rollbackRoot"
 ~~~
 
-执行前必须把示例中的 `YYYYMMDD-HHMMSS` 替换为真实备份目录名。部署前不存在的 DLL 不会被恢复；如果部署前存在 `dxgi.dll.tmp`，脚本会按状态记录把它恢复。
+执行前必须替换 `<GAME_ROOT>` 和 `<PREDEPLOY_BACKUP_ROOT>`；后者应使用第 7 节输出的确切备份目录。部署前不存在的 DLL 不会被恢复；如果部署前存在 `dxgi.dll.tmp`，脚本会按状态记录把它恢复。回滚中的移动和复制不是跨文件事务；任一步失败时应立即停止，保留备份目录与脚本已经输出的回滚暂存目录，再人工核对四个受管文件，不要继续启动游戏或重复覆盖。
 
 ## 14. 分支和文档边界
 

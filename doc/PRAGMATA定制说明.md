@@ -9,6 +9,16 @@
 
 本文记录的是 2026-08-30 已完成 Release x64 全量重编译并实际用于 PRAGMATA 的基线。它用于后续升级、复现和排查，不代表这些游戏配置项的内部实现已经由游戏源码验证。
 
+本文不记录任何机器的真实目录。示例中的占位符含义如下：
+
+| 占位符 | 含义 |
+|---|---|
+| `<GAME_ROOT>` | `PRAGMATA.exe` 与 `config.ini` 所在目录 |
+| `<BACKUP_BASE>` | 游戏目录之外、用于保存配置备份的目录 |
+| `<CONFIG_BACKUP_ROOT>` | 某次配置备份的确切目录，即备份命令输出的路径 |
+
+执行命令前必须先把占位符替换为当前机器上的实际目录。
+
 ## 2. 定制目标
 
 原代理只在进程路径包含 `NRC-Win64-Shipping` 时加载 `rendertest.dll`。这会让代理绑定到某一个游戏名，PRAGMATA 的进程名不匹配时只会转发 DXGI，无法启用捕获。
@@ -82,7 +92,7 @@
 文件位置：
 
 ~~~text
-E:\PRAGMATA\config.ini
+<GAME_ROOT>\config.ini
 ~~~
 
 当前验证可用的 `[Render]` 段：
@@ -94,7 +104,7 @@ Capability=DirectX12
 ForceMeshShader=Disable
 ParallelBuildCommandList=Disable
 ParallelBuildProcessorCount=0
-RenderWorkerThreadPriorityAboveNormal=Enable
+RenderWorkerThreadPriorityAboveNormal=Disable
 TightFitShaderCache=Disable
 UseComputeQueuePairing=Disable
 UsingIndepentRenderWorker=Disable
@@ -109,7 +119,7 @@ UsingIndepentRenderWorker=Disable
 | `ForceMeshShader` | `Disable` | 不强制 Mesh Shader；与 `AllowMeshShader=Disable` 保持一致，避免互相矛盾。 |
 | `ParallelBuildCommandList` | `Disable` | 关闭并行构建命令列表，降低捕获时命令记录与提交顺序的复杂度。 |
 | `ParallelBuildProcessorCount` | `0` | 与并行构建关闭配套，不指定固定处理器数量；`0` 的最终解释由游戏实现决定，在当前组合中不单独调整。 |
-| `RenderWorkerThreadPriorityAboveNormal` | `Enable` | 保持游戏当前的高优先级渲染工作线程策略，这是实测可用组合的一部分；若出现调度异常，可单独改为 `Disable` 做对照。 |
+| `RenderWorkerThreadPriorityAboveNormal` | `Disable` | 关闭渲染工作线程的高优先级调度，减少捕获期间与 RenderDoc 工作线程争抢 CPU 调度资源的可能性。 |
 | `TightFitShaderCache` | `Disable` | 不启用更激进的紧凑 Shader Cache 策略，优先保持捕获路径稳定。 |
 | `UseComputeQueuePairing` | `Disable` | 关闭计算队列配对，减少跨队列同步路径。 |
 | `UsingIndepentRenderWorker` | `Disable` | 关闭独立渲染工作线程，减少额外线程与命令提交路径。键名中的 `Indepent` 是游戏现有拼写，不要擅自改成 `Independent`。 |
@@ -131,11 +141,16 @@ RenderDoc 需要记录图形 API 调用、资源状态、命令列表和队列�
 修改前先退出 PRAGMATA，再把配置备份到游戏目录之外的时间戳目录：
 
 ~~~powershell
-$configPath = 'E:\PRAGMATA\config.ini'
-$backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupRoot = Join-Path 'E:\PRAGMATA-backups' "config-$backupStamp"
-New-Item -ItemType Directory -Path $backupRoot -Force -ErrorAction Stop | Out-Null
-Copy-Item -LiteralPath $configPath -Destination (Join-Path $backupRoot 'config.ini') -Force -ErrorAction Stop
+$gameRoot = '<GAME_ROOT>'
+$backupBase = '<BACKUP_BASE>'
+$configPath = Join-Path $gameRoot 'config.ini'
+$backupStamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+$backupRoot = Join-Path $backupBase "config-$backupStamp"
+if (-not (Test-Path -LiteralPath $backupBase -PathType Container)) {
+  New-Item -ItemType Directory -Path $backupBase -ErrorAction Stop | Out-Null
+}
+New-Item -ItemType Directory -Path $backupRoot -ErrorAction Stop | Out-Null
+Copy-Item -LiteralPath $configPath -Destination (Join-Path $backupRoot 'config.ini') -ErrorAction Stop
 "配置备份目录：$backupRoot"
 ~~~
 
@@ -149,9 +164,13 @@ Copy-Item -LiteralPath $configPath -Destination (Join-Path $backupRoot 'config.i
 需要恢复时，先退出游戏，将下面的备份目录替换为上一步输出的实际目录，再执行：
 
 ~~~powershell
-$backupRoot = 'E:\PRAGMATA-backups\config-YYYYMMDD-HHMMSS'
-Copy-Item -LiteralPath (Join-Path $backupRoot 'config.ini') -Destination 'E:\PRAGMATA\config.ini' -Force -ErrorAction Stop
+$gameRoot = '<GAME_ROOT>'
+$backupRoot = '<CONFIG_BACKUP_ROOT>'
+Copy-Item -LiteralPath (Join-Path $backupRoot 'config.ini') `
+  -Destination (Join-Path $gameRoot 'config.ini') -Force -ErrorAction Stop
 ~~~
+
+截帧前建议使用游戏内帧率上限或显卡驱动设置，将游戏限制在稳定的 30 FPS。较低且稳定的帧率通常能减少捕获期间的命令量、资源变化和瞬时调度压力。该设置是稳定性建议，不是代理工作的硬性条件；修改帧率限制后，应重启游戏再生成新捕获。
 
 ## 6. 已知边界
 
